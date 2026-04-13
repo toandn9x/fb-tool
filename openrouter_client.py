@@ -4,7 +4,7 @@ OpenRouter API client – generate AI replies using free models.
 
 import httpx
 import logging
-
+import re
 import random
 
 logger = logging.getLogger(__name__)
@@ -73,6 +73,53 @@ def get_random_fallback() -> str:
     return random.choice(FALLBACK_MESSAGE)
 
 
+def _clean_ai_reply(raw: str) -> str:
+    """
+    Lọc bỏ phần suy luận/reasoning của AI, chỉ giữ lại câu trả lời cuối.
+
+    Một số model (đặc biệt DeepSeek) hay output quá trình suy nghĩ
+    trước khi đưa ra câu trả lời thực sự.
+    """
+    text = raw.strip()
+
+    # 1. Loại bỏ <think>...</think> hoặc <reasoning>...</reasoning>
+    text = re.sub(
+        r"<(?:think|thinking|reasoning)>.*?</(?:think|thinking|reasoning)>",
+        "", text, flags=re.DOTALL | re.IGNORECASE,
+    ).strip()
+
+    # 2. Nếu có pattern "So answer:" hoặc "So the answer is:" → lấy phần sau
+    for marker in [
+        "So the answer is:", "So answer:", "Final answer:",
+        "My reply:", "Reply:", "Response:", "Output:",
+    ]:
+        if marker.lower() in text.lower():
+            idx = text.lower().index(marker.lower()) + len(marker)
+            candidate = text[idx:].strip().strip('"').strip("'").strip()
+            if candidate:
+                text = candidate
+                break
+
+    # 3. Nếu text bắt đầu bằng tiếng Anh reasoning, lấy dòng cuối (thường là câu trả lời VN)
+    if text and re.match(r"^(We need|According to|The user|I should|Let me|Based on)", text, re.IGNORECASE):
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        # Tìm dòng cuối có tiếng Việt
+        for line in reversed(lines):
+            if re.search(r"[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]", line, re.IGNORECASE):
+                text = line.strip('"').strip("'").strip()
+                break
+
+    # 4. Loại bỏ dấu ngoặc kép bao quanh nếu có
+    if len(text) > 2 and text[0] == '"' and text[-1] == '"':
+        text = text[1:-1].strip()
+
+    # 5. Loại bỏ markdown còn sót
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"^[-•]\s*", "", text)
+
+    return text.strip()
+
+
 async def generate_reply(
     api_key: str,
     model: str,
@@ -120,7 +167,14 @@ async def generate_reply(
             response.raise_for_status()
             data = response.json()
 
-            reply = data["choices"][0]["message"]["content"].strip()
+            raw_reply = data["choices"][0]["message"]["content"].strip()
+            reply = _clean_ai_reply(raw_reply)
+
+            # Nếu sau khi clean mà rỗng → dùng fallback
+            if not reply:
+                logger.warning(f"AI reply empty after cleaning. Raw: {raw_reply[:100]}")
+                return get_random_fallback()
+
             logger.info(f"AI reply generated: {reply[:80]}...")
             return reply
 
