@@ -18,7 +18,7 @@ Bot Python tự động trả lời comment trên fanpage Facebook sử dụng A
 
 ### 1. Tải về và cài đặt thư viện
 ```bash
-cd fb-tool
+cd project
 pip install -r requirements.txt
 ```
 
@@ -61,12 +61,26 @@ Comment mới → Gọi Model FREE
                          │
                          ├─ OK → Reply thành công ✓
                          │
-                         └─ Fail → Dùng fallback message
-                    
-⏰ Sau 2 tiếng → Tự động thử lại Model FREE
+                         └─ Fail → Random fallback message ✓ (vẫn reply)
 ```
 
-**Monitoring:** Truy cập `http://localhost:8686/model-status` để xem model nào đang hoạt động.
+### Chu kỳ tự động thử lại
+
+```
+[0h] FREE fail → chuyển sang PAID (bắt đầu đếm 2 tiếng)
+     Trong 2 tiếng tiếp theo: mọi comment dùng PAID
+
+[2h] ⏰ Cooldown hết → tự động quay về FREE
+     FREE OK   → tiếp tục dùng FREE ✓
+     FREE fail → lại chuyển sang PAID (đếm 2 tiếng tiếp)
+
+     ↻ Lặp lại vô hạn
+```
+
+> [!NOTE]
+> **Bot không bao giờ bỏ sót comment.** Nếu cả FREE lẫn PAID đều fail, bot sẽ reply bằng 1 câu ngẫu nhiên từ danh sách ~70 fallback message (cảm ơn + mời follow page) đã cấu hình sẵn trong `openrouter_client.py`.
+
+**Monitoring:** Truy cập `http://localhost:8686/dashboard` để xem thống kê model usage theo ngày và lịch sử switch.
 
 ---
 
