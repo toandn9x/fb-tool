@@ -20,9 +20,16 @@ class Settings:
 
         # OpenRouter
         self.OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-        self.OPENROUTER_MODEL = os.getenv(
-            "OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"
+        self.OPENROUTER_MODEL_FREE = os.getenv(
+            "OPENROUTER_MODEL_FREE", "openai/gpt-oss-120b:free"
         )
+        self.OPENROUTER_MODEL_PAID = os.getenv(
+            "OPENROUTER_MODEL_PAID", "deepseek/deepseek-chat"
+        )
+        # Thời gian chờ trước khi thử lại model free (phút)
+        self.MODEL_FALLBACK_COOLDOWN = int(os.getenv(
+            "MODEL_FALLBACK_COOLDOWN", "120"
+        ))
 
         # Google Sheets
         self.GOOGLE_SHEETS_CREDENTIALS = os.getenv(
