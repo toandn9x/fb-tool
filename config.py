@@ -51,6 +51,11 @@ class Settings:
             "AUTO_LIKE_REACTION_TYPE", "LIKE"
         ).upper()
 
+        # Recent Comments
+        self.RECENT_COMMENTS_LIMIT = int(os.getenv(
+            "RECENT_COMMENTS_LIMIT", "10"
+        ))
+
         # Prompts
         self.prompts = self._load_prompts()
 

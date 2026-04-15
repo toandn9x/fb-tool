@@ -241,6 +241,18 @@ async def process_comment(
                 like_status=like_status,
             )
 
+        # 9. Ghi vào recent comments (cho homepage)
+        from model_stats import stats as model_stats_inst
+        from openrouter_client import model_manager as mm
+        model_stats_inst.record_comment(
+            commenter_name=commenter_name,
+            comment_text=comment_text,
+            reply_text=reply_text,
+            status=status,
+            model_used=mm.current_model if mm else "",
+            max_items=settings.RECENT_COMMENTS_LIMIT,
+        )
+
         logger.info(f"Done processing comment {comment_id} → {status}")
 
     except Exception as e:
@@ -256,17 +268,381 @@ async def process_comment(
                 like_status=like_status,
             )
 
+# ── Shared ───────────────────────────────────────────────────────────────
+from fastapi.responses import HTMLResponse
+import time as _time
 
-# ── Health Check ─────────────────────────────────────────────────────────
-@app.get("/")
-async def health():
+_boot_time = _time.time()
+
+SHARED_CSS = """
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: #0f0f23;
+    color: #e0e0e0;
+    min-height: 100vh;
+  }
+  .topnav {
+    background: #1a1a2e;
+    border-bottom: 1px solid #2a2a4a;
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    gap: 24px;
+  }
+  .topnav .brand {
+    font-weight: 700;
+    font-size: 1.1em;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .topnav a {
+    color: #888;
+    text-decoration: none;
+    font-size: 0.9em;
+    padding: 6px 14px;
+    border-radius: 8px;
+    transition: all 0.2s;
+  }
+  .topnav a:hover { background: #2a2a4a; color: #e0e0e0; }
+  .topnav a.active { background: #667eea22; color: #667eea; }
+  .container { padding: 30px; max-width: 1200px; margin: 0 auto; }
+  .green { color: #4ade80; }
+  .blue { color: #60a5fa; }
+  .yellow { color: #fbbf24; }
+  .red { color: #f87171; }
+  .orange { color: #fb923c; }
+  .cyan { color: #22d3ee; }
+  .purple { color: #a78bfa; }
+"""
+
+NAV_HTML = """
+<nav class="topnav">
+  <span class="brand">🤖 FB Auto-Reply Bot</span>
+  <a href="/" {home_active}>Trang chủ</a>
+  <a href="/dashboard" {dash_active}>Dashboard</a>
+  <a href="/api/stats" {api_active}>API</a>
+</nav>
+"""
+
+
+def _nav(active: str = "home") -> str:
+    return NAV_HTML.format(
+        home_active='class="active"' if active == "home" else "",
+        dash_active='class="active"' if active == "dashboard" else "",
+        api_active='class="active"' if active == "api" else "",
+    )
+
+
+def _uptime() -> str:
+    secs = int(_time.time() - _boot_time)
+    days, secs = divmod(secs, 86400)
+    hours, secs = divmod(secs, 3600)
+    mins, secs = divmod(secs, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    parts.append(f"{mins}m {secs}s")
+    return " ".join(parts)
+
+
+# ── Homepage ─────────────────────────────────────────────────────────────
+@app.get("/", response_class=HTMLResponse)
+async def homepage():
     from openrouter_client import model_manager as mm
-    return {
-        "status": "running",
-        "current_model": mm.current_model if mm else "N/A",
-        "using_free": mm.is_using_free if mm else None,
-        "delay": settings.REPLY_DELAY_SECONDS,
-    }
+    from model_stats import stats
+    from datetime import datetime
+
+    model_info = mm.status() if mm else {}
+    today = stats.get_today()
+
+    status_class = "status-free" if model_info.get("using_free") else "status-paid"
+    status_label = "🟢 FREE" if model_info.get("using_free") else "🟡 PAID"
+    current_model = model_info.get("current_model", "N/A")
+    uptime = _uptime()
+    now = datetime.now().strftime("%H:%M:%S %d/%m/%Y")
+
+    # Tính tỷ lệ free hôm nay
+    total = today["total_replies"]
+    free_pct = f'{today["free_success"]/total*100:.0f}' if total > 0 else "0"
+
+    # Build recent comments rows
+    recent_comments = stats.get_recent_comments()
+    comment_rows = ""
+    for c in recent_comments:
+        status_cls = "tag-free" if c["status"] == "đã reply" else "tag-paid"
+        model_short = c["model"].split("/")[-1] if c.get("model") else ""
+        comment_rows += f"""
+        <tr>
+            <td>{c['time']}</td>
+            <td><strong>{c['commenter']}</strong></td>
+            <td class="comment-cell">{c['comment']}</td>
+            <td class="reply-cell">{c['reply']}</td>
+            <td><span class="tag {status_cls}">{c['status']}</span></td>
+            <td style="font-size:0.75em;color:#888;">{model_short}</td>
+        </tr>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="60">
+<title>FB Auto-Reply Bot</title>
+<style>
+  {SHARED_CSS}
+  .hero {{
+    text-align: center;
+    padding: 50px 20px 30px;
+  }}
+  .hero h1 {{
+    font-size: 2.4em;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 8px;
+  }}
+  .hero .tagline {{ color: #666; font-size: 0.95em; }}
+
+  .status-pill {{
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: #1a1a2e;
+    border: 1px solid #2a2a4a;
+    border-radius: 50px;
+    padding: 10px 24px;
+    margin: 20px 0;
+    font-size: 0.95em;
+  }}
+  .status-pill.status-free {{ border-color: #4ade8044; }}
+  .status-pill.status-paid {{ border-color: #fbbf2444; }}
+  .status-pill .model {{ font-family: monospace; color: #a78bfa; font-size: 0.9em; }}
+
+  .info-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 20px;
+    margin: 30px 0;
+  }}
+  .info-card {{
+    background: #1a1a2e;
+    border-radius: 14px;
+    padding: 24px;
+    border: 1px solid #2a2a4a;
+  }}
+  .info-card h3 {{
+    color: #a78bfa;
+    font-size: 0.85em;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 16px;
+  }}
+  .info-row {{
+    display: flex;
+    justify-content: space-between;
+    padding: 6px 0;
+    font-size: 0.9em;
+    border-bottom: 1px solid #2a2a4a22;
+  }}
+  .info-row .label {{ color: #888; }}
+  .info-row .value {{ font-family: monospace; }}
+
+  .quick-stats {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 12px;
+    margin: 30px 0;
+  }}
+  .stat-card {{
+    background: #1a1a2e;
+    border-radius: 12px;
+    padding: 16px;
+    text-align: center;
+    border: 1px solid #2a2a4a;
+  }}
+  .stat-card .num {{
+    font-size: 1.8em;
+    font-weight: 700;
+    font-family: monospace;
+  }}
+  .stat-card .lbl {{ color: #888; font-size: 0.75em; text-transform: uppercase; margin-top: 4px; }}
+
+  .nav-cards {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    margin: 30px 0;
+  }}
+  .nav-card {{
+    background: #1a1a2e;
+    border: 1px solid #2a2a4a;
+    border-radius: 14px;
+    padding: 24px;
+    text-decoration: none;
+    color: #e0e0e0;
+    transition: all 0.25s;
+  }}
+  .nav-card:hover {{
+    border-color: #667eea;
+    transform: translateY(-2px);
+    box-shadow: 0 8px 25px rgba(102, 126, 234, 0.15);
+  }}
+  .nav-card .icon {{ font-size: 1.8em; margin-bottom: 10px; }}
+  .nav-card .title {{ font-weight: 600; margin-bottom: 6px; }}
+  .nav-card .desc {{ color: #888; font-size: 0.8em; line-height: 1.4; }}
+
+  .footer {{ text-align: center; color: #444; font-size: 0.75em; padding: 30px 0 10px; }}
+
+  .section {{ margin: 30px 0; }}
+  .section h2 {{
+    font-size: 1.1em;
+    color: #a78bfa;
+    margin-bottom: 12px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid #2a2a4a;
+  }}
+  table {{
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85em;
+  }}
+  th {{
+    background: #16213e;
+    padding: 10px 8px;
+    text-align: left;
+    color: #a78bfa;
+    font-weight: 600;
+  }}
+  td {{
+    padding: 8px;
+    border-bottom: 1px solid #1a1a2e;
+  }}
+  tr:hover {{ background: #16213e44; }}
+  .comment-cell {{ max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #ccc; }}
+  .reply-cell {{ max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #4ade80; }}
+  .tag {{
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 0.8em;
+    font-weight: 600;
+  }}
+  .tag-free {{ background: #4ade8022; color: #4ade80; border: 1px solid #4ade8044; }}
+  .tag-paid {{ background: #f8717122; color: #f87171; border: 1px solid #f8717144; }}
+
+  @media (max-width: 600px) {{
+    .hero h1 {{ font-size: 1.6em; }}
+    .info-grid {{ grid-template-columns: 1fr; }}
+    .quick-stats {{ grid-template-columns: repeat(2, 1fr); }}
+  }}
+</style>
+</head>
+<body>
+
+{_nav("home")}
+
+<div class="container">
+
+<div class="hero">
+  <h1>🤖 FB Auto-Reply Bot</h1>
+  <div class="tagline">Tự động trả lời comment fanpage bằng AI</div>
+  <div class="status-pill {status_class}">
+    {status_label}
+    <span class="model">{current_model}</span>
+  </div>
+</div>
+
+<div class="quick-stats">
+  <div class="stat-card">
+    <div class="num green">{today['free_success']}</div>
+    <div class="lbl">Free OK</div>
+  </div>
+  <div class="stat-card">
+    <div class="num blue">{today['paid_success']}</div>
+    <div class="lbl">Paid OK</div>
+  </div>
+  <div class="stat-card">
+    <div class="num yellow">{today['fallback_used']}</div>
+    <div class="lbl">Fallback</div>
+  </div>
+  <div class="stat-card">
+    <div class="num" style="color:#e0e0e0;">{total}</div>
+    <div class="lbl">Tổng hôm nay</div>
+  </div>
+  <div class="stat-card">
+    <div class="num purple">{free_pct}%</div>
+    <div class="lbl">Tỷ lệ Free</div>
+  </div>
+</div>
+
+<div class="info-grid">
+  <div class="info-card">
+    <h3>⚙️ Cấu hình</h3>
+    <div class="info-row"><span class="label">Model Free</span><span class="value purple">{settings.OPENROUTER_MODEL_FREE}</span></div>
+    <div class="info-row"><span class="label">Model Paid</span><span class="value blue">{settings.OPENROUTER_MODEL_PAID}</span></div>
+    <div class="info-row"><span class="label">Cooldown</span><span class="value">{settings.MODEL_FALLBACK_COOLDOWN} phút</span></div>
+    <div class="info-row"><span class="label">Reply Delay</span><span class="value">{settings.REPLY_DELAY_SECONDS}s</span></div>
+    <div class="info-row"><span class="label">Auto Like</span><span class="value green">{settings.AUTO_LIKE_REACTION_TYPE}</span></div>
+  </div>
+  <div class="info-card">
+    <h3>📡 Trạng thái</h3>
+    <div class="info-row"><span class="label">Status</span><span class="value green">Running</span></div>
+    <div class="info-row"><span class="label">Uptime</span><span class="value">{uptime}</span></div>
+    <div class="info-row"><span class="label">Port</span><span class="value">{settings.SERVER_PORT}</span></div>
+    <div class="info-row"><span class="label">Google Sheet</span><span class="value">{settings.GOOGLE_SHEET_NAME}</span></div>
+    <div class="info-row"><span class="label">Cập nhật</span><span class="value">{now}</span></div>
+  </div>
+</div>
+
+<div class="nav-cards">
+  <a href="/dashboard" class="nav-card">
+    <div class="icon">📊</div>
+    <div class="title">Dashboard</div>
+    <div class="desc">Thống kê model usage theo ngày, lịch sử switch, bảng chi tiết 14 ngày</div>
+  </a>
+  <a href="/api/stats" class="nav-card">
+    <div class="icon">🔌</div>
+    <div class="title">Stats API</div>
+    <div class="desc">JSON API trả về toàn bộ dữ liệu thống kê cho tích hợp bên ngoài</div>
+  </a>
+  <a href="/model-status" class="nav-card">
+    <div class="icon">🔧</div>
+    <div class="title">Model Status</div>
+    <div class="desc">JSON chi tiết trạng thái ModelManager: model đang dùng, cooldown, fail count</div>
+  </a>
+</div>
+
+<div class="section">
+  <h2>💬 {settings.RECENT_COMMENTS_LIMIT} Comment gần nhất (hôm nay)</h2>
+  <div style="overflow-x:auto;">
+  <table>
+    <thead>
+      <tr>
+        <th>Giờ</th>
+        <th>Người BL</th>
+        <th>Comment</th>
+        <th>Reply</th>
+        <th>Trạng thái</th>
+        <th>Model</th>
+      </tr>
+    </thead>
+    <tbody>
+      {comment_rows if comment_rows else '<tr><td colspan="6" style="text-align:center;color:#666;">Chưa có comment nào hôm nay</td></tr>'}
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<div class="footer">Auto-refresh mỗi 60 giây &nbsp;•&nbsp; FB Auto-Reply Bot v1.0</div>
+
+</div>
+</body>
+</html>"""
+    return html
 
 
 @app.get("/model-status")
@@ -289,9 +665,6 @@ async def api_stats():
         **stats.get_all_data(),
     }
 
-
-# ── Dashboard ────────────────────────────────────────────────────────────
-from fastapi.responses import HTMLResponse
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
@@ -347,14 +720,8 @@ async def dashboard():
 <meta http-equiv="refresh" content="30">
 <title>Bot Dashboard – Model Stats</title>
 <style>
-  * {{ margin:0; padding:0; box-sizing:border-box; }}
-  body {{
-    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
-    background: #0f0f23;
-    color: #e0e0e0;
-    padding: 20px;
-    min-height: 100vh;
-  }}
+  {SHARED_CSS}
+  .container {{ padding: 30px; max-width: 1200px; margin: 0 auto; }}
   .header {{
     text-align: center;
     margin-bottom: 30px;
@@ -387,12 +754,6 @@ async def dashboard():
     margin: 8px 0 4px;
   }}
   .card .label {{ color: #888; font-size: 0.8em; text-transform: uppercase; }}
-  .green {{ color: #4ade80; }}
-  .blue {{ color: #60a5fa; }}
-  .yellow {{ color: #fbbf24; }}
-  .red {{ color: #f87171; }}
-  .orange {{ color: #fb923c; }}
-  .cyan {{ color: #22d3ee; }}
 
   .status-banner {{
     background: #1a1a2e;
@@ -461,8 +822,12 @@ async def dashboard():
 </head>
 <body>
 
+{_nav("dashboard")}
+
+<div class="container">
+
 <div class="header">
-  <h1>🤖 Bot Dashboard</h1>
+  <h1>📊 Bot Dashboard</h1>
   <div class="subtitle">Model Usage Statistics – Cập nhật lúc {data['generated_at']}</div>
 </div>
 
@@ -554,8 +919,9 @@ async def dashboard():
   </div>
 </div>
 
-<div class="auto-refresh">Tự động refresh sau mỗi 30 giây &nbsp;|&nbsp; <a href="/api/stats" style="color:#667eea;">JSON API</a></div>
+<div class="auto-refresh">Tự động refresh sau mỗi 30 giây &nbsp;|&nbsp; <a href="/api/stats" style="color:#667eea;">JSON API</a> &nbsp;|&nbsp; <a href="/" style="color:#667eea;">Trang chủ</a></div>
 
+</div>
 </body>
 </html>"""
     return html

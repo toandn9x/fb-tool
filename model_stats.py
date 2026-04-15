@@ -20,8 +20,11 @@ class ModelStats:
     def __init__(self):
         # Thống kê theo ngày: {"2026-04-14": {"free_success": 5, ...}}
         self.daily: dict[str, dict] = {}
-        # Lịch sử switch events (giữ tối đa 100 events gần nhất)
+        # Lịch sử switch events (giữ tối đa 200 events gần nhất)
         self.switch_history: list[dict] = []
+        # 10 comment gần nhất (tự reset theo ngày)
+        self._recent_comments: list[dict] = []
+        self._recent_comments_date: str = ""
         # Load từ file nếu có
         self._load()
 
@@ -101,6 +104,37 @@ class ModelStats:
             self.switch_history = self.switch_history[-200:]
         self._save()
 
+    def record_comment(
+        self,
+        commenter_name: str,
+        comment_text: str,
+        reply_text: str,
+        status: str,
+        model_used: str = "",
+        max_items: int = 10,
+    ):
+        """Ghi nhận comment và câu trả lời. Tự reset khi sang ngày mới."""
+        today = self._today()
+        # Reset nếu sang ngày mới
+        if self._recent_comments_date != today:
+            self._recent_comments = []
+            self._recent_comments_date = today
+
+        self._recent_comments.append({
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "commenter": commenter_name,
+            "comment": comment_text[:100],  # Cắt ngắn để tiết kiệm bộ nhớ
+            "reply": reply_text[:150],
+            "status": status,
+            "model": model_used,
+        })
+
+        # Chỉ giữ N comment gần nhất
+        if len(self._recent_comments) > max_items:
+            self._recent_comments = self._recent_comments[-max_items:]
+
+        self._save()
+
     def get_today(self) -> dict:
         day = self._today()
         self._ensure_day(day)
@@ -118,12 +152,20 @@ class ModelStats:
         """Lấy N switch events gần nhất."""
         return list(reversed(self.switch_history[-limit:]))
 
+    def get_recent_comments(self) -> list[dict]:
+        """Lấy 10 comment gần nhất của hôm nay."""
+        today = self._today()
+        if self._recent_comments_date != today:
+            return []
+        return list(reversed(self._recent_comments))
+
     def get_all_data(self) -> dict:
         """Trả về toàn bộ data cho API/dashboard."""
         return {
             "today": self.get_today(),
             "daily_summary": self.get_daily_summary(),
             "recent_switches": self.get_recent_switches(),
+            "recent_comments": self.get_recent_comments(),
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
@@ -132,6 +174,8 @@ class ModelStats:
             data = {
                 "daily": self.daily,
                 "switch_history": self.switch_history,
+                "recent_comments": self._recent_comments,
+                "recent_comments_date": self._recent_comments_date,
             }
             with open(STATS_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -146,9 +190,12 @@ class ModelStats:
                 data = json.load(f)
             self.daily = data.get("daily", {})
             self.switch_history = data.get("switch_history", [])
+            self._recent_comments = data.get("recent_comments", [])
+            self._recent_comments_date = data.get("recent_comments_date", "")
             logger.info(
                 f"Loaded model stats: {len(self.daily)} days, "
-                f"{len(self.switch_history)} switch events"
+                f"{len(self.switch_history)} switch events, "
+                f"{len(self._recent_comments)} recent comments"
             )
         except Exception as e:
             logger.error(f"Failed to load model stats: {e}")
