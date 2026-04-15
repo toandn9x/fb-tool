@@ -6,6 +6,7 @@ Bot Python tự động trả lời comment trên fanpage Facebook sử dụng A
 - **Tự động trả lời:** Sử dụng AI từ OpenRouter (hỗ trợ nhiều model miễn phí và trả phí).
 - **Auto-Switch Model:** Ưu tiên model miễn phí, tự động chuyển sang model trả phí khi bị rate limit, và tự thử lại free sau mỗi 2 tiếng.
 - **Auto Like/React Comment:** Tự động Like hoặc React (LOVE, HAHA, WOW, SAD, ANGRY) mọi comment mới, thực hiện ngay lập tức trước khi reply.
+- **Dashboard trực quan:** Trang chủ và Dashboard dark-theme hiển thị thống kê model usage, lịch sử switch, 10–20 comment gần nhất với link bài viết.
 - **Lọc comment thông minh:** Tự động bỏ qua emoji, comment quá ngắn hoặc comment trùng lặp.
 - **Lọc reasoning AI:** Tự động loại bỏ phần suy luận tiếng Anh của AI, chỉ giữ câu trả lời tiếng Việt.
 - **Delay thông minh:** Cấu hình thời gian chờ giữa các lần reply để tránh bị Facebook đánh dấu spam.
@@ -42,6 +43,7 @@ cp .env.example .env
 | `REPLY_DELAY_SECONDS` | Thời gian chờ giữa các reply (giây) |
 | `AUTO_LIKE_ENABLED` | Bật/tắt Auto Like (Mặc định: `true`) |
 | `AUTO_LIKE_REACTION_TYPE` | Loại reaction: `LIKE`, `LOVE`, `HAHA`, `WOW`, `SAD`, `ANGRY` (Mặc định: `LIKE`) |
+| `RECENT_COMMENTS_LIMIT` | Số comment gần nhất hiển trên trang chủ (Mặc định: `10`) |
 
 ---
 
@@ -133,10 +135,10 @@ ngrok http 8686
 
 | Endpoint | Mô tả |
 |---|---|
-| `GET /` | Health check – xem bot đang chạy, model hiện tại |
-| `GET /dashboard` | 📊 Dashboard trực quan – thống kê model usage theo ngày, lịch sử switch |
+| `GET /` | 🏠 Trang chủ trực quan – trạng thái bot, cấu hình, uptime, comment gần nhất |
+| `GET /dashboard` | 📊 Dashboard – thống kê model usage theo ngày, lịch sử switch |
 | `GET /model-status` | Xem trạng thái model (free/paid, thời gian switch, số lần fail) |
-| `GET /api/stats` | JSON API – toàn bộ dữ liệu thống kê (daily summary + switch history) |
+| `GET /api/stats` | JSON API – toàn bộ dữ liệu thống kê (daily summary + switch history + comments) |
 | `GET /webhook` | Facebook webhook verification |
 | `POST /webhook` | Nhận sự kiện comment từ Facebook |
 
@@ -165,12 +167,12 @@ ngrok http 8686
 ---
 
 ## 📂 Cấu trúc thư mục
-- `main.py`: Server chính xử lý webhook + API endpoints + Dashboard.
+- `main.py`: Server chính xử lý webhook + Trang chủ + Dashboard + API.
 - `config.py`: Quản lý cấu hình và biến môi trường.
 - `prompts.json`: Nơi tùy chỉnh nội dung AI trả lời.
 - `facebook_client.py`: Các hàm tương tác với Facebook Graph API (reply, like/react).
 - `openrouter_client.py`: Kết nối API AI + ModelManager (auto-switch free/paid).
-- `model_stats.py`: Thống kê model usage theo ngày, lưu vào `model_stats.json`.
+- `model_stats.py`: Thống kê model usage + recent comments theo ngày, lưu vào `model_stats.json`.
 - `sheets_logger.py`: Xử lý ghi log vào Google Sheets.
 - `comment_filter.py`: Bộ lọc thông minh cho bình luận.
-- `.gitignore`: Đã cấu hình để bỏ qua các file nhạy cảm như `.env`, `credentials.json`, `model_stats.json`.
+- `.gitignore`: Bỏ qua các file nhạy cảm: `.env`, `credentials.json`, `model_stats.json`.
