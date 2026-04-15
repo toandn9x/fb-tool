@@ -111,6 +111,7 @@ class ModelStats:
         reply_text: str,
         status: str,
         model_used: str = "",
+        post_id: str = "",
         max_items: int = 10,
     ):
         """Ghi nhận comment và câu trả lời. Tự reset khi sang ngày mới."""
@@ -127,6 +128,7 @@ class ModelStats:
             "reply": reply_text[:150],
             "status": status,
             "model": model_used,
+            "post_id": post_id,
         })
 
         # Chỉ giữ N comment gần nhất

@@ -250,6 +250,7 @@ async def process_comment(
             reply_text=reply_text,
             status=status,
             model_used=mm.current_model if mm else "",
+            post_id=post_id,
             max_items=settings.RECENT_COMMENTS_LIMIT,
         )
 
@@ -375,6 +376,8 @@ async def homepage():
     for c in recent_comments:
         status_cls = "tag-free" if c["status"] == "đã reply" else "tag-paid"
         model_short = c["model"].split("/")[-1] if c.get("model") else ""
+        pid = c.get("post_id", "")
+        post_link = f'<a href="https://www.facebook.com/{pid}" target="_blank" style="color:#60a5fa;text-decoration:none;" title="Xem bài viết">Xem bài ↗</a>' if pid else "—"
         comment_rows += f"""
         <tr>
             <td>{c['time']}</td>
@@ -383,6 +386,7 @@ async def homepage():
             <td class="reply-cell">{c['reply']}</td>
             <td><span class="tag {status_cls}">{c['status']}</span></td>
             <td style="font-size:0.75em;color:#888;">{model_short}</td>
+            <td>{post_link}</td>
         </tr>"""
 
     html = f"""<!DOCTYPE html>
@@ -628,10 +632,11 @@ async def homepage():
         <th>Reply</th>
         <th>Trạng thái</th>
         <th>Model</th>
+        <th>Bài viết</th>
       </tr>
     </thead>
     <tbody>
-      {comment_rows if comment_rows else '<tr><td colspan="6" style="text-align:center;color:#666;">Chưa có comment nào hôm nay</td></tr>'}
+      {comment_rows if comment_rows else '<tr><td colspan="7" style="text-align:center;color:#666;">Chưa có comment nào hôm nay</td></tr>'}
     </tbody>
   </table>
   </div>
