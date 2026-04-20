@@ -39,6 +39,8 @@ class WorkerState:
         self.current_item: dict | None = None
         self.current_stage: str = "idle"
         self.current_started_at: datetime | None = None
+        # Thời điểm bắt đầu stage hiện tại – để tính stage_elapsed riêng với total_elapsed
+        self.current_stage_started_at: datetime | None = None
 
         self.total_enqueued = 0
         self.total_completed = 0   # reply thành công
@@ -89,12 +91,15 @@ class WorkerState:
             "comment_text": item.get("comment_text", ""),
             "post_id": item.get("post_id", ""),
         }
-        self.current_started_at = datetime.now()
+        now = datetime.now()
+        self.current_started_at = now
+        self.current_stage_started_at = now
         self.current_stage = "starting"
 
     # ── Chuyển stage ────────────────────────────────────────────────────
     def set_stage(self, stage: str):
         self.current_stage = stage
+        self.current_stage_started_at = datetime.now()
 
     # ── Hoàn tất 1 item ─────────────────────────────────────────────────
     def on_complete(
@@ -129,25 +134,32 @@ class WorkerState:
 
         self.current_item = None
         self.current_started_at = None
+        self.current_stage_started_at = None
         self.current_stage = "idle"
 
     # ── Snapshot cho dashboard/API ──────────────────────────────────────
     def snapshot(self, queue_size: int = 0, history_limit: int = 20) -> dict:
         self._check_day_rollover()
+        now = datetime.now()
+
         current = None
         if self.current_item and self.current_started_at:
-            elapsed = (datetime.now() - self.current_started_at).total_seconds()
+            elapsed = (now - self.current_started_at).total_seconds()
+            stage_elapsed = 0.0
+            if self.current_stage_started_at:
+                stage_elapsed = (now - self.current_stage_started_at).total_seconds()
             current = {
                 **self.current_item,
                 "stage": self.current_stage,
                 "stage_label": STAGES.get(self.current_stage, self.current_stage),
                 "elapsed_sec": round(elapsed, 2),
+                "stage_elapsed_sec": round(stage_elapsed, 2),
                 "started_at": self.current_started_at.strftime("%H:%M:%S"),
             }
 
         uptime = None
         if self.worker_started_at:
-            secs = int((datetime.now() - self.worker_started_at).total_seconds())
+            secs = int((now - self.worker_started_at).total_seconds())
             d, secs = divmod(secs, 86400)
             h, secs = divmod(secs, 3600)
             m, s = divmod(secs, 60)
@@ -158,6 +170,21 @@ class WorkerState:
                 parts.append(f"{h}h")
             parts.append(f"{m}m {s}s")
             uptime = " ".join(parts)
+
+        # Throughput & ETA – tính từ history (10 item gần nhất cho ổn định)
+        recent_elapsed = [h["elapsed_sec"] for h in self.history[-10:]]
+        avg_elapsed = (
+            round(sum(recent_elapsed) / len(recent_elapsed), 2)
+            if recent_elapsed else 0.0
+        )
+        in_flight = 1 if self.current_item else 0
+        remaining = queue_size + in_flight
+        eta_seconds = int(remaining * avg_elapsed) if avg_elapsed > 0 else 0
+        per_minute = round(60 / avg_elapsed, 1) if avg_elapsed > 0 else 0.0
+
+        total_done = (
+            self.total_completed + self.total_skipped + self.total_failed
+        )
 
         return {
             "worker_running": self.worker_started_at is not None,
@@ -174,9 +201,17 @@ class WorkerState:
                 "skipped": self.total_skipped,
                 "failed": self.total_failed,
                 "in_queue": queue_size,
+                "in_flight": in_flight,
+                "total_done": total_done,
+            },
+            "throughput": {
+                "avg_elapsed_sec": avg_elapsed,
+                "per_minute": per_minute,
+                "eta_seconds": eta_seconds,
+                "remaining": remaining,
             },
             "history": list(reversed(self.history[-history_limit:])),
-            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
 

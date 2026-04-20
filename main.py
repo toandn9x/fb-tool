@@ -16,6 +16,7 @@ from openrouter_client import generate_reply, init_model_manager, model_manager
 from facebook_client import reply_comment, like_comment, get_post_content, verify_signature
 from sheets_logger import SheetsLogger
 from worker_state import state as worker_state
+import queue_db
 
 # ── Logging ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -69,10 +70,24 @@ async def lifespan(app: FastAPI):
     logger.info(f"  http://localhost:{port}/api/worker  → Worker API")
     logger.info("=" * 50)
 
+    # ── Khởi tạo SQLite persistent queue ──────────────────────────────
+    queue_db.init_db()
+    queue_db.cleanup_old_done()  # dọn record 'done' cũ hơn 7 ngày
+
     # Khởi tạo queue + worker xử lý comment tuần tự
     comment_queue = asyncio.Queue()
     _worker_task = asyncio.create_task(_comment_worker())
     logger.info("Comment queue worker started (xử lý tuần tự)")
+
+    # ── Recovery: nạp lại các comment chưa xử lý từ lần chạy trước ───
+    recovered = queue_db.load_unfinished()
+    if recovered:
+        for item in recovered:
+            await comment_queue.put(item)
+            worker_state.on_enqueue(item)
+        logger.info(
+            f"Recovery: đã nạp lại {len(recovered)} comment vào queue"
+        )
 
     try:
         yield
@@ -160,6 +175,14 @@ async def webhook_handler(request: Request):
                     "commenter_id": commenter_id,
                     "commenter_name": commenter_name,
                 }
+                # Persist vào DB trước khi đưa vào in-memory queue.
+                # INSERT OR IGNORE → tự bỏ qua nếu là duplicate webhook.
+                saved = queue_db.save_pending(item)
+                if not saved:
+                    logger.info(
+                        f"Duplicate webhook, bỏ qua comment {comment_id}"
+                    )
+                    continue
                 await comment_queue.put(item)
                 worker_state.on_enqueue(item)
                 logger.info(
@@ -180,6 +203,9 @@ async def _comment_worker():
     worker_state.on_worker_start()
     while True:
         item = await comment_queue.get()
+        comment_id = item.get("comment_id", "")
+        # Đánh dấu đang xử lý trong DB
+        queue_db.mark_processing(comment_id)
         worker_state.on_start_processing(item)
         try:
             await process_comment(**item)
@@ -189,6 +215,8 @@ async def _comment_worker():
             # Safety net – nếu process_comment crash mà chưa kịp on_complete
             if worker_state.current_item is not None:
                 worker_state.on_complete("lỗi – worker exception")
+            # Đánh dấu hoàn tất trong DB (dù lỗi hay thành công)
+            queue_db.mark_done(comment_id)
             comment_queue.task_done()
 
 
@@ -459,12 +487,13 @@ async def homepage():
             <td>{post_link}</td>
         </tr>"""
 
+    refresh_s = settings.HOMEPAGE_REFRESH_SECONDS
     html = f"""<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="refresh" content="60">
+{_refresh_meta(refresh_s)}
 <title>FB Auto-Reply Bot</title>
 <style>
   {SHARED_CSS}
@@ -717,7 +746,7 @@ async def homepage():
   </div>
 </div>
 
-<div class="footer">Auto-refresh mỗi 60 giây &nbsp;•&nbsp; FB Auto-Reply Bot v1.0</div>
+<div class="footer">{_refresh_label(refresh_s)} &nbsp;•&nbsp; FB Auto-Reply Bot v1.0</div>
 
 </div>
 </body>
@@ -757,6 +786,34 @@ async def api_worker():
     )
 
 
+def _refresh_meta(seconds: int) -> str:
+    """Emit meta tag auto-refresh, trả rỗng nếu seconds <= 0 (tắt refresh)."""
+    if seconds and seconds > 0:
+        return f'<meta http-equiv="refresh" content="{seconds}">'
+    return ""
+
+
+def _refresh_label(seconds: int) -> str:
+    """Label footer: 'Tự động refresh mỗi Ns' hoặc 'Auto-refresh: tắt'."""
+    if seconds and seconds > 0:
+        return f"Tự động refresh mỗi {seconds}s"
+    return "Auto-refresh: tắt"
+
+
+def _fmt_duration(secs: int) -> str:
+    """Format giây → '1h 20m 5s' hoặc '5m 20s' hoặc '45s'."""
+    secs = int(secs)
+    if secs <= 0:
+        return "0s"
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
 @app.get("/worker", response_class=HTMLResponse)
 async def worker_page():
     """Trang theo dõi worker real-time: item đang xử lý, queue, lịch sử."""
@@ -774,6 +831,25 @@ async def worker_page():
 
     current = snap["current"]
     counters = snap["counters"]
+    throughput = snap["throughput"]
+    delay_s = settings.REPLY_DELAY_SECONDS
+
+    # Tính số liệu cho Progress section
+    enq = counters["enqueued"]
+    done = counters["total_done"]
+    done_pct = (done / enq * 100) if enq > 0 else 0
+    reply_pct = (
+        counters["completed"] / done * 100 if done > 0 else 0
+    )
+    skip_pct = (
+        counters["skipped"] / done * 100 if done > 0 else 0
+    )
+    fail_pct = (
+        counters["failed"] / done * 100 if done > 0 else 0
+    )
+    avg_sec = throughput["avg_elapsed_sec"]
+    eta_str = _fmt_duration(throughput["eta_seconds"]) if throughput["eta_seconds"] > 0 else "—"
+    per_min = throughput["per_minute"]
 
     # Card hiển thị item đang xử lý (nếu có)
     if current:
@@ -784,16 +860,51 @@ async def worker_page():
             f'style="color:#60a5fa;">Xem bài ↗</a>'
             if post_id else "—"
         )
+        total_el = current["elapsed_sec"]
+        stage_el = current.get("stage_elapsed_sec", 0)
+        stage = current["stage"]
+
+        # Nếu stage là delay → hiển thị progress bar tới REPLY_DELAY_SECONDS
+        stage_progress_html = ""
+        if stage in ("react_delay", "reply_delay") and delay_s > 0:
+            pct = min(100, (stage_el / delay_s) * 100)
+            stage_progress_html = f"""
+            <div class="stage-progress">
+              <div class="stage-progress-bar" style="width:{pct:.0f}%"></div>
+              <div class="stage-progress-label">{stage_el:.0f}s / {delay_s}s</div>
+            </div>"""
+
+        # Cảnh báo stuck nếu total > 3× avg (và avg > 0)
+        stuck_badge = ""
+        avg = throughput["avg_elapsed_sec"]
+        if avg > 0 and total_el > avg * 3:
+            stuck_badge = (
+                f'<span class="stuck-badge" title="Chậm hơn 3× trung bình '
+                f'({avg:.0f}s)">⚠ Chậm bất thường</span>'
+            )
+
         current_html = f"""
         <div class="current-card">
           <div class="current-header">
             <span class="pulse"></span>
             <strong>Đang xử lý</strong>
             <span class="stage-badge">{current['stage_label']}</span>
+            {stuck_badge}
             <span style="margin-left:auto;color:#888;font-size:0.85em;">
-              ⏱ {current['elapsed_sec']}s &nbsp;•&nbsp; bắt đầu {current['started_at']}
+              bắt đầu {current['started_at']}
             </span>
           </div>
+          <div class="current-times">
+            <div class="time-box">
+              <div class="time-label">Tổng</div>
+              <div class="time-value">⏱ {_fmt_duration(total_el)}</div>
+            </div>
+            <div class="time-box">
+              <div class="time-label">Stage này</div>
+              <div class="time-value stage-time">🔸 {stage_el:.1f}s</div>
+            </div>
+          </div>
+          {stage_progress_html}
           <div class="current-body">
             <div class="row"><span class="label">Người BL</span>
               <span class="value"><strong>{current['commenter_name']}</strong></span></div>
@@ -853,12 +964,13 @@ async def worker_page():
             <td>{comment_link}</td>
         </tr>"""
 
+    refresh_s = settings.WORKER_REFRESH_SECONDS
     html = f"""<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="refresh" content="3">
+{_refresh_meta(refresh_s)}
 <title>Worker Monitor – FB Auto-Reply Bot</title>
 <style>
   {SHARED_CSS}
@@ -969,6 +1081,149 @@ async def worker_page():
     font-size: 0.8em;
     border: 1px solid #667eea44;
   }}
+  .stuck-badge {{
+    background: #f8717122;
+    color: #f87171;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 0.8em;
+    border: 1px solid #f8717166;
+    animation: blink 1s infinite;
+  }}
+  @keyframes blink {{
+    50% {{ opacity: 0.5; }}
+  }}
+
+  /* ── Tiến độ hôm nay ─────────────────────────────────── */
+  .progress-section {{
+    background: #1a1a2e;
+    border: 1px solid #2a2a4a;
+    border-radius: 12px;
+    padding: 18px 22px;
+    margin-bottom: 20px;
+  }}
+  .progress-header {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 10px;
+  }}
+  .progress-math {{
+    margin-left: 12px;
+    color: #888;
+    font-size: 0.85em;
+  }}
+  .progress-pct-label {{
+    font-size: 1.1em;
+    font-weight: 700;
+    color: #4ade80;
+    font-family: monospace;
+  }}
+  .progress-bar-wrap {{
+    display: flex;
+    height: 18px;
+    border-radius: 10px;
+    overflow: hidden;
+    background: #2a2a4a;
+    margin: 10px 0 12px;
+  }}
+  .progress-seg {{ height: 100%; transition: width 0.4s; }}
+  .progress-seg.green-bar {{ background: #4ade80; }}
+  .progress-seg.yellow-bar {{ background: #fbbf24; }}
+  .progress-seg.red-bar {{ background: #f87171; }}
+  .progress-seg.inflight-bar {{
+    background: repeating-linear-gradient(
+      45deg, #a78bfa, #a78bfa 6px, #8f6fe0 6px, #8f6fe0 12px
+    );
+  }}
+  .progress-legend {{
+    display: flex;
+    gap: 18px;
+    flex-wrap: wrap;
+    font-size: 0.82em;
+    color: #aaa;
+  }}
+  .progress-legend .dot {{
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    margin-right: 5px;
+    vertical-align: middle;
+  }}
+  .green-dot {{ background: #4ade80; }}
+  .yellow-dot {{ background: #fbbf24; }}
+  .red-dot {{ background: #f87171; }}
+  .inflight-dot {{ background: #a78bfa; }}
+  .queue-dot {{ background: #60a5fa; }}
+
+  /* ── Throughput / ETA ────────────────────────────────── */
+  .throughput-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px;
+    margin-bottom: 20px;
+  }}
+  .tp-card {{
+    background: #1a1a2e;
+    border: 1px solid #2a2a4a;
+    border-radius: 12px;
+    padding: 16px 20px;
+  }}
+  .tp-card.eta {{ border-left: 3px solid #60a5fa; }}
+  .tp-label {{ color: #888; font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.5px; }}
+  .tp-value {{
+    font-size: 1.6em;
+    font-family: monospace;
+    color: #e0e0e0;
+    margin: 4px 0 2px;
+  }}
+  .tp-unit {{ font-size: 0.55em; color: #888; margin-left: 3px; }}
+  .tp-sub {{ font-size: 0.75em; color: #666; }}
+
+  /* ── Current card: tách Total vs Stage ───────────────── */
+  .current-times {{
+    display: flex;
+    gap: 12px;
+    margin: 10px 0;
+  }}
+  .time-box {{
+    flex: 1;
+    background: #0f0f23;
+    border-radius: 8px;
+    padding: 10px 14px;
+    border: 1px solid #2a2a4a;
+  }}
+  .time-label {{ color: #888; font-size: 0.72em; text-transform: uppercase; }}
+  .time-value {{ font-family: monospace; color: #e0e0e0; font-size: 1.1em; margin-top: 3px; }}
+  .stage-time {{ color: #fbbf24; }}
+
+  .stage-progress {{
+    position: relative;
+    height: 14px;
+    background: #2a2a4a;
+    border-radius: 8px;
+    overflow: hidden;
+    margin: 8px 0 12px;
+  }}
+  .stage-progress-bar {{
+    height: 100%;
+    background: linear-gradient(90deg, #fbbf24, #f59e0b);
+    transition: width 0.5s;
+  }}
+  .stage-progress-label {{
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.75em;
+    color: #0f0f23;
+    font-weight: 700;
+    font-family: monospace;
+  }}
 
   .section {{ margin-bottom: 25px; }}
   .section h2 {{
@@ -1026,8 +1281,55 @@ async def worker_page():
   </div>
 </div>
 
+<div class="progress-section">
+  <div class="progress-header">
+    <div>
+      <strong>Tiến độ hôm nay</strong>
+      <span class="progress-math">
+        Nhận <strong style="color:#e0e0e0;">{enq}</strong>
+        = Xong <strong class="green">{done}</strong>
+        + Đang xử lý <strong style="color:#a78bfa;">{counters['in_flight']}</strong>
+        + Chờ <strong style="color:#60a5fa;">{counters['in_queue']}</strong>
+      </span>
+    </div>
+    <div class="progress-pct-label">{done_pct:.0f}% &nbsp;<span style="color:#666;">({done}/{enq})</span></div>
+  </div>
+  <div class="progress-bar-wrap">
+    <div class="progress-seg green-bar" style="width:{(counters['completed']/enq*100) if enq else 0:.2f}%" title="Đã reply: {counters['completed']}"></div>
+    <div class="progress-seg yellow-bar" style="width:{(counters['skipped']/enq*100) if enq else 0:.2f}%" title="Bỏ qua: {counters['skipped']}"></div>
+    <div class="progress-seg red-bar" style="width:{(counters['failed']/enq*100) if enq else 0:.2f}%" title="Lỗi: {counters['failed']}"></div>
+    <div class="progress-seg inflight-bar" style="width:{(counters['in_flight']/enq*100) if enq else 0:.2f}%" title="Đang xử lý: {counters['in_flight']}"></div>
+  </div>
+  <div class="progress-legend">
+    <span><span class="dot green-dot"></span>Reply {counters['completed']} ({reply_pct:.0f}%)</span>
+    <span><span class="dot yellow-dot"></span>Skip {counters['skipped']} ({skip_pct:.0f}%)</span>
+    <span><span class="dot red-dot"></span>Lỗi {counters['failed']} ({fail_pct:.0f}%)</span>
+    <span><span class="dot inflight-dot"></span>In-flight {counters['in_flight']}</span>
+    <span><span class="dot queue-dot"></span>Chờ {counters['in_queue']}</span>
+  </div>
+</div>
+
+<div class="throughput-grid">
+  <div class="tp-card">
+    <div class="tp-label">⚡ Avg / comment</div>
+    <div class="tp-value">{avg_sec:.1f}<span class="tp-unit">s</span></div>
+    <div class="tp-sub">{per_min}/phút</div>
+  </div>
+  <div class="tp-card eta">
+    <div class="tp-label">⏳ ETA hết queue</div>
+    <div class="tp-value">{eta_str}</div>
+    <div class="tp-sub">{counters['in_queue']} chờ + {counters['in_flight']} đang xử lý</div>
+  </div>
+  <div class="tp-card">
+    <div class="tp-label">⚙️ Delay cấu hình</div>
+    <div class="tp-value">{delay_s}<span class="tp-unit">s</span></div>
+    <div class="tp-sub">áp dụng react + reply</div>
+  </div>
+</div>
+
 <div class="counters">
   <div class="counter-card"><div class="num" style="color:#60a5fa;">{counters['in_queue']}</div><div class="lbl">Đang chờ</div></div>
+  <div class="counter-card"><div class="num" style="color:#a78bfa;">{counters['in_flight']}</div><div class="lbl">Đang xử lý</div></div>
   <div class="counter-card"><div class="num" style="color:#e0e0e0;">{counters['enqueued']}</div><div class="lbl">Tổng nhận</div></div>
   <div class="counter-card"><div class="num green">{counters['completed']}</div><div class="lbl">Đã reply</div></div>
   <div class="counter-card"><div class="num yellow">{counters['skipped']}</div><div class="lbl">Bỏ qua</div></div>
@@ -1061,7 +1363,7 @@ async def worker_page():
 </div>
 
 <div class="auto-refresh">
-  Tự động refresh mỗi 3 giây
+  {_refresh_label(refresh_s)}
   &nbsp;|&nbsp; <a href="/api/worker" style="color:#667eea;">JSON API</a>
   &nbsp;|&nbsp; <a href="/dashboard" style="color:#667eea;">Dashboard</a>
 </div>
@@ -1118,12 +1420,13 @@ async def dashboard():
     current_model = model_info.get("current_model", "N/A")
     switched_at = model_info.get("switched_at") or "—"
 
+    refresh_s = settings.DASHBOARD_REFRESH_SECONDS
     html = f"""<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="refresh" content="30">
+{_refresh_meta(refresh_s)}
 <title>Bot Dashboard – Model Stats</title>
 <style>
   {SHARED_CSS}
@@ -1325,7 +1628,7 @@ async def dashboard():
   </div>
 </div>
 
-<div class="auto-refresh">Tự động refresh sau mỗi 30 giây &nbsp;|&nbsp; <a href="/api/stats" style="color:#667eea;">JSON API</a> &nbsp;|&nbsp; <a href="/" style="color:#667eea;">Trang chủ</a></div>
+<div class="auto-refresh">{_refresh_label(refresh_s)} &nbsp;|&nbsp; <a href="/api/stats" style="color:#667eea;">JSON API</a> &nbsp;|&nbsp; <a href="/" style="color:#667eea;">Trang chủ</a></div>
 
 </div>
 </body>

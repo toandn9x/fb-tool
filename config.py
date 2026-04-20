@@ -56,6 +56,17 @@ class Settings:
             "RECENT_COMMENTS_LIMIT", "10"
         ))
 
+        # Auto-refresh intervals cho UI (giây). Đặt 0 để tắt auto-refresh.
+        self.HOMEPAGE_REFRESH_SECONDS = int(os.getenv(
+            "HOMEPAGE_REFRESH_SECONDS", "60"
+        ))
+        self.DASHBOARD_REFRESH_SECONDS = int(os.getenv(
+            "DASHBOARD_REFRESH_SECONDS", "30"
+        ))
+        self.WORKER_REFRESH_SECONDS = int(os.getenv(
+            "WORKER_REFRESH_SECONDS", "3"
+        ))
+
         # Prompts
         self.prompts = self._load_prompts()
 

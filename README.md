@@ -46,6 +46,9 @@ cp .env.example .env
 | `AUTO_LIKE_ENABLED` | Bật/tắt Auto Like (Mặc định: `true`) |
 | `AUTO_LIKE_REACTION_TYPE` | Loại reaction: `LIKE`, `LOVE`, `HAHA`, `WOW`, `SAD`, `ANGRY` (Mặc định: `LIKE`) |
 | `RECENT_COMMENTS_LIMIT` | Số comment gần nhất hiển thị trên trang chủ & worker page (Mặc định: `10`) |
+| `HOMEPAGE_REFRESH_SECONDS` | Auto-refresh trang chủ (giây, `0` = tắt). Mặc định: `60` |
+| `DASHBOARD_REFRESH_SECONDS` | Auto-refresh dashboard (giây, `0` = tắt). Mặc định: `30` |
+| `WORKER_REFRESH_SECONDS` | Auto-refresh worker page (giây, `0` = tắt). Mặc định: `3` – tăng lên nếu muốn giảm tải server |
 
 ---
 

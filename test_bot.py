@@ -548,6 +548,15 @@ class TestWebhookEndpoints(unittest.TestCase):
         self.assertIn("Worker Monitor", response.text)
         self.assertIn("Đang chờ", response.text)
 
+    def test_refresh_meta_helper(self):
+        """_refresh_meta trả meta tag khi > 0, rỗng khi 0/None (tắt auto-refresh)."""
+        from main import _refresh_meta, _refresh_label
+        self.assertIn('content="30"', _refresh_meta(30))
+        self.assertEqual(_refresh_meta(0), "")
+        self.assertEqual(_refresh_meta(None), "")
+        self.assertIn("30s", _refresh_label(30))
+        self.assertIn("tắt", _refresh_label(0))
+
     def test_api_worker_returns_json_snapshot(self):
         """/api/worker trả JSON với các field bắt buộc."""
         response = self.client.get("/api/worker")
@@ -930,6 +939,58 @@ class TestWorkerState(unittest.TestCase):
         snap = self.ws.snapshot(queue_size=0)
         self.assertEqual(snap["counters"]["completed"], 0)
         self.assertEqual(len(snap["history"]), 0)
+
+    def test_snapshot_throughput_and_eta(self):
+        """Snapshot trả throughput (avg, per_minute, eta) dựa trên history."""
+        # Inject history có elapsed_sec cố định
+        for i in range(5):
+            self.ws.on_start_processing(self._sample_item(f"c{i}"))
+            self.ws.on_complete("đã reply")
+        # Override elapsed_sec để test toán chính xác
+        for h in self.ws.history:
+            h["elapsed_sec"] = 60.0
+
+        snap = self.ws.snapshot(queue_size=10)
+        tp = snap["throughput"]
+        self.assertEqual(tp["avg_elapsed_sec"], 60.0)
+        self.assertEqual(tp["per_minute"], 1.0)           # 60/60 = 1
+        # remaining = queue 10 + in_flight 0, eta = 10*60 = 600s
+        self.assertEqual(tp["remaining"], 10)
+        self.assertEqual(tp["eta_seconds"], 600)
+
+    def test_snapshot_throughput_empty_history(self):
+        """History rỗng → avg = 0, eta = 0, per_minute = 0 (không lỗi chia 0)."""
+        snap = self.ws.snapshot(queue_size=5)
+        tp = snap["throughput"]
+        self.assertEqual(tp["avg_elapsed_sec"], 0.0)
+        self.assertEqual(tp["per_minute"], 0.0)
+        self.assertEqual(tp["eta_seconds"], 0)
+
+    def test_stage_elapsed_resets_on_set_stage(self):
+        """set_stage reset stage timer → stage_elapsed phản ánh đúng stage hiện tại."""
+        self.ws.on_start_processing(self._sample_item("c1"))
+        time.sleep(0.05)
+        self.ws.set_stage("generating_ai")  # reset stage timer
+
+        snap = self.ws.snapshot(queue_size=0)
+        # total elapsed ≥ 0.05s, stage elapsed < total (vì vừa reset)
+        self.assertGreaterEqual(snap["current"]["elapsed_sec"], 0.05)
+        self.assertLess(
+            snap["current"]["stage_elapsed_sec"],
+            snap["current"]["elapsed_sec"],
+        )
+
+    def test_counters_include_in_flight_and_total_done(self):
+        """Counters có thêm in_flight và total_done."""
+        self.ws.on_start_processing(self._sample_item("c1"))
+        self.ws.on_complete("đã reply")
+        self.ws.on_start_processing(self._sample_item("c2"))
+        self.ws.on_complete("bỏ qua – emoji")
+        self.ws.on_start_processing(self._sample_item("c3"))  # còn đang xử lý
+
+        snap = self.ws.snapshot(queue_size=0)
+        self.assertEqual(snap["counters"]["in_flight"], 1)
+        self.assertEqual(snap["counters"]["total_done"], 2)  # completed + skipped
 
 
 # ═══════════════════════════════════════════════════════════════════════════
