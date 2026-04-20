@@ -15,6 +15,7 @@ from comment_filter import should_reply
 from openrouter_client import generate_reply, init_model_manager, model_manager
 from facebook_client import reply_comment, like_comment, get_post_content, verify_signature
 from sheets_logger import SheetsLogger
+from worker_state import state as worker_state
 
 # ── Logging ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -26,12 +27,14 @@ logger = logging.getLogger("bot")
 
 # ── Globals ──────────────────────────────────────────────────────────────
 sheets: SheetsLogger | None = None
+comment_queue: asyncio.Queue | None = None
+_worker_task: asyncio.Task | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown events."""
-    global sheets
+    global sheets, comment_queue, _worker_task
     try:
         sheets = SheetsLogger(
             credentials_path=settings.GOOGLE_SHEETS_CREDENTIALS,
@@ -53,17 +56,34 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Free    : {settings.OPENROUTER_MODEL_FREE}")
     logger.info(f"  Paid    : {settings.OPENROUTER_MODEL_PAID}")
     logger.info(f"  Cooldown: {settings.MODEL_FALLBACK_COOLDOWN} phút")
-    logger.info(f"  Delay   : {settings.REPLY_DELAY_SECONDS}s")
+    logger.info(f"  Delay   : {settings.REPLY_DELAY_SECONDS}s (áp dụng cho cả react & reply, tuần tự)")
     logger.info(f"  AutoLike: {settings.AUTO_LIKE_ENABLED} ({settings.AUTO_LIKE_REACTION_TYPE})")
     logger.info(f"  Sheet   : {settings.GOOGLE_SHEET_NAME}")
     logger.info("-" * 50)
     port = settings.SERVER_PORT
-    logger.info(f"  http://localhost:{port}/           → Health Check")
+    logger.info(f"  http://localhost:{port}/           → Trang chủ")
     logger.info(f"  http://localhost:{port}/dashboard   → Dashboard")
+    logger.info(f"  http://localhost:{port}/worker      → Worker Monitor")
     logger.info(f"  http://localhost:{port}/model-status → Model Status")
     logger.info(f"  http://localhost:{port}/api/stats   → Stats API")
+    logger.info(f"  http://localhost:{port}/api/worker  → Worker API")
     logger.info("=" * 50)
-    yield
+
+    # Khởi tạo queue + worker xử lý comment tuần tự
+    comment_queue = asyncio.Queue()
+    _worker_task = asyncio.create_task(_comment_worker())
+    logger.info("Comment queue worker started (xử lý tuần tự)")
+
+    try:
+        yield
+    finally:
+        if _worker_task:
+            _worker_task.cancel()
+            try:
+                await _worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            logger.info("Comment queue worker stopped")
 
 
 app = FastAPI(title="FB Auto-Reply Bot", lifespan=lifespan)
@@ -130,19 +150,54 @@ async def webhook_handler(request: Request):
                 f"{comment_text[:50]}..."
             )
 
-            # Process in background to respond quickly to Facebook
-            asyncio.create_task(
-                process_comment(
-                    page_id=page_id,
-                    post_id=post_id,
-                    comment_id=comment_id,
-                    comment_text=comment_text,
-                    commenter_id=commenter_id,
-                    commenter_name=commenter_name,
+            # Enqueue – worker sẽ xử lý tuần tự, không miss comment nào
+            if comment_queue is not None:
+                item = {
+                    "page_id": page_id,
+                    "post_id": post_id,
+                    "comment_id": comment_id,
+                    "comment_text": comment_text,
+                    "commenter_id": commenter_id,
+                    "commenter_name": commenter_name,
+                }
+                await comment_queue.put(item)
+                worker_state.on_enqueue(item)
+                logger.info(
+                    f"Queued comment {comment_id} "
+                    f"(hàng đợi: {comment_queue.qsize()})"
                 )
-            )
 
     return {"status": "ok"}
+
+
+# ── Comment Queue Worker ────────────────────────────────────────────────
+async def _comment_worker():
+    """
+    Worker duy nhất tiêu thụ comment_queue tuần tự.
+    Đảm bảo FB chỉ nhận tối đa 1 action (react hoặc reply) mỗi
+    REPLY_DELAY_SECONDS giây → tránh bị đánh dấu spam/bot.
+    """
+    worker_state.on_worker_start()
+    while True:
+        item = await comment_queue.get()
+        worker_state.on_start_processing(item)
+        try:
+            await process_comment(**item)
+        except Exception as e:
+            logger.error(f"Worker error: {e}")
+        finally:
+            # Safety net – nếu process_comment crash mà chưa kịp on_complete
+            if worker_state.current_item is not None:
+                worker_state.on_complete("lỗi – worker exception")
+            comment_queue.task_done()
+
+
+async def _fb_delay():
+    """Delay chung trước mỗi lần gọi Facebook API (react / reply)."""
+    delay = settings.REPLY_DELAY_SECONDS
+    if delay > 0:
+        logger.info(f"Chờ {delay}s trước FB action...")
+        await asyncio.sleep(delay)
 
 
 # ── Comment Processing ──────────────────────────────────────────────────
@@ -154,11 +209,17 @@ async def process_comment(
     commenter_id: str,
     commenter_name: str,
 ):
-    """Process a single comment: filter → delay → AI → reply → log."""
+    """
+    Xử lý 1 comment tuần tự trong worker:
+    delay → react → filter → AI → delay → reply → log.
+    """
     like_status = ""
     try:
-        # 1. Auto Like/React (thực hiện ngay, không cần chờ delay)
+        # 1. Auto Like/React (chờ delay trước khi gọi FB)
         if settings.AUTO_LIKE_ENABLED:
+            worker_state.set_stage("react_delay")
+            await _fb_delay()
+            worker_state.set_stage("reacting")
             reaction = settings.AUTO_LIKE_REACTION_TYPE
             liked = await like_comment(
                 comment_id=comment_id,
@@ -166,11 +227,10 @@ async def process_comment(
                 reaction_type=reaction,
             )
             like_status = f"đã {reaction}" if liked else f"lỗi {reaction}"
-            logger.info(
-                f"Auto-react {comment_id}: {like_status}"
-            )
+            logger.info(f"Auto-react {comment_id}: {like_status}")
 
         # 2. Filter
+        worker_state.set_stage("filtering")
         ok, reason = should_reply(
             comment_text=comment_text,
             commenter_id=commenter_id,
@@ -181,6 +241,7 @@ async def process_comment(
 
         if not ok:
             logger.info(f"Skipped comment {comment_id}: {reason}")
+            worker_state.set_stage("logging")
             if sheets:
                 sheets.log_comment(
                     post_id=post_id,
@@ -191,20 +252,16 @@ async def process_comment(
                     status=f"bỏ qua – {reason}",
                     like_status=like_status,
                 )
+            worker_state.on_complete(f"bỏ qua – {reason}")
             return
 
-        # 3. Delay
-        delay = settings.REPLY_DELAY_SECONDS
-        if delay > 0:
-            logger.info(f"Waiting {delay}s before replying...")
-            await asyncio.sleep(delay)
-
-        # 4. Fetch post content for context
+        # 3. Fetch post content for context
+        worker_state.set_stage("fetching_post")
         post_content = await get_post_content(
             post_id, settings.FB_PAGE_ACCESS_TOKEN
         )
 
-        # 5. Build prompt
+        # 4. Build prompt
         prompts = settings.prompts
         system_prompt = prompts.get("system_prompt", "")
         user_message = prompts.get("reply_instruction", "").format(
@@ -213,7 +270,8 @@ async def process_comment(
             commenter_name=commenter_name,
         )
 
-        # 6. Generate AI reply
+        # 5. Generate AI reply (không phải FB API → không cần delay)
+        worker_state.set_stage("generating_ai")
         reply_text = await generate_reply(
             api_key=settings.OPENROUTER_API_KEY,
             system_prompt=system_prompt,
@@ -221,14 +279,18 @@ async def process_comment(
             max_tokens=prompts.get("max_tokens", 150),
         )
 
-        # 7. Reply on Facebook
+        # 6. Reply on Facebook (chờ delay trước khi gọi FB)
+        worker_state.set_stage("reply_delay")
+        await _fb_delay()
+        worker_state.set_stage("replying")
         success = await reply_comment(
             comment_id=comment_id,
             message=reply_text,
             access_token=settings.FB_PAGE_ACCESS_TOKEN,
         )
 
-        # 8. Log to Google Sheets
+        # 7. Log to Google Sheets
+        worker_state.set_stage("logging")
         status = "đã reply" if success else "lỗi"
         if sheets:
             sheets.log_comment(
@@ -241,7 +303,7 @@ async def process_comment(
                 like_status=like_status,
             )
 
-        # 9. Ghi vào recent comments (cho homepage)
+        # 8. Ghi vào recent comments (cho homepage)
         from model_stats import stats as model_stats_inst
         from openrouter_client import model_manager as mm
         model_stats_inst.record_comment(
@@ -255,6 +317,11 @@ async def process_comment(
         )
 
         logger.info(f"Done processing comment {comment_id} → {status}")
+        worker_state.on_complete(
+            status,
+            reply_text=reply_text,
+            model_used=mm.current_model if mm else "",
+        )
 
     except Exception as e:
         logger.error(f"Error processing comment {comment_id}: {e}")
@@ -268,6 +335,7 @@ async def process_comment(
                 status=f"lỗi – {e}",
                 like_status=like_status,
             )
+        worker_state.on_complete(f"lỗi – {e}")
 
 # ── Shared ───────────────────────────────────────────────────────────────
 from fastapi.responses import HTMLResponse
@@ -323,6 +391,7 @@ NAV_HTML = """
   <span class="brand">🤖 FB Auto-Reply Bot</span>
   <a href="/" {home_active}>Trang chủ</a>
   <a href="/dashboard" {dash_active}>Dashboard</a>
+  <a href="/worker" {worker_active}>Worker</a>
   <a href="/api/stats" {api_active}>API</a>
 </nav>
 """
@@ -332,6 +401,7 @@ def _nav(active: str = "home") -> str:
     return NAV_HTML.format(
         home_active='class="active"' if active == "home" else "",
         dash_active='class="active"' if active == "dashboard" else "",
+        worker_active='class="active"' if active == "worker" else "",
         api_active='class="active"' if active == "api" else "",
     )
 
@@ -608,13 +678,18 @@ async def homepage():
     <div class="title">Dashboard</div>
     <div class="desc">Thống kê model usage theo ngày, lịch sử switch, bảng chi tiết 14 ngày</div>
   </a>
+  <a href="/worker" class="nav-card">
+    <div class="icon">🔧</div>
+    <div class="title">Worker Monitor</div>
+    <div class="desc">Theo dõi real-time: comment đang xử lý, stage, queue, lịch sử {settings.RECENT_COMMENTS_LIMIT} comment gần nhất</div>
+  </a>
   <a href="/api/stats" class="nav-card">
     <div class="icon">🔌</div>
     <div class="title">Stats API</div>
     <div class="desc">JSON API trả về toàn bộ dữ liệu thống kê cho tích hợp bên ngoài</div>
   </a>
   <a href="/model-status" class="nav-card">
-    <div class="icon">🔧</div>
+    <div class="icon">⚙️</div>
     <div class="title">Model Status</div>
     <div class="desc">JSON chi tiết trạng thái ModelManager: model đang dùng, cooldown, fail count</div>
   </a>
@@ -669,6 +744,332 @@ async def api_stats():
         "model_status": mm.status() if mm else {},
         **stats.get_all_data(),
     }
+
+
+# ── Worker Status API ────────────────────────────────────────────────────
+@app.get("/api/worker")
+async def api_worker():
+    """JSON snapshot trạng thái worker real-time."""
+    qsize = comment_queue.qsize() if comment_queue else 0
+    return worker_state.snapshot(
+        queue_size=qsize,
+        history_limit=settings.RECENT_COMMENTS_LIMIT,
+    )
+
+
+@app.get("/worker", response_class=HTMLResponse)
+async def worker_page():
+    """Trang theo dõi worker real-time: item đang xử lý, queue, lịch sử."""
+    qsize = comment_queue.qsize() if comment_queue else 0
+    snap = worker_state.snapshot(
+        queue_size=qsize,
+        history_limit=settings.RECENT_COMMENTS_LIMIT,
+    )
+
+    running = snap["worker_running"]
+    status_class = "status-free" if running else "status-paid"
+    status_label = "🟢 RUNNING" if running else "⛔ STOPPED"
+    uptime = snap["worker_uptime"] or "—"
+    started_at = snap["worker_started_at"] or "—"
+
+    current = snap["current"]
+    counters = snap["counters"]
+
+    # Card hiển thị item đang xử lý (nếu có)
+    if current:
+        comment_preview = (current["comment_text"] or "")[:200]
+        post_id = current.get("post_id", "")
+        post_link = (
+            f'<a href="https://www.facebook.com/{post_id}" target="_blank" '
+            f'style="color:#60a5fa;">Xem bài ↗</a>'
+            if post_id else "—"
+        )
+        current_html = f"""
+        <div class="current-card">
+          <div class="current-header">
+            <span class="pulse"></span>
+            <strong>Đang xử lý</strong>
+            <span class="stage-badge">{current['stage_label']}</span>
+            <span style="margin-left:auto;color:#888;font-size:0.85em;">
+              ⏱ {current['elapsed_sec']}s &nbsp;•&nbsp; bắt đầu {current['started_at']}
+            </span>
+          </div>
+          <div class="current-body">
+            <div class="row"><span class="label">Người BL</span>
+              <span class="value"><strong>{current['commenter_name']}</strong></span></div>
+            <div class="row"><span class="label">Comment ID</span>
+              <span class="value mono">{current['comment_id']}</span></div>
+            <div class="row"><span class="label">Nội dung</span>
+              <span class="value">{comment_preview}</span></div>
+            <div class="row"><span class="label">Bài viết</span>
+              <span class="value">{post_link}</span></div>
+          </div>
+        </div>"""
+    else:
+        current_html = """
+        <div class="current-card idle">
+          <div class="current-header">
+            <span class="dot-idle"></span>
+            <strong>Worker đang rảnh</strong>
+            <span style="margin-left:auto;color:#666;font-size:0.85em;">
+              chờ comment tiếp theo…
+            </span>
+          </div>
+        </div>"""
+
+    # Bảng lịch sử – cấu trúc giống trang chủ (thêm Reply, Model, Bài viết)
+    history_rows = ""
+    for h in snap["history"]:
+        status = h["status"]
+        if status == "đã reply":
+            cls = "tag-free"
+        elif status.startswith("bỏ qua"):
+            cls = "tag-skip"
+        else:
+            cls = "tag-paid"
+        model_short = h["model"].split("/")[-1] if h.get("model") else ""
+        pid = h.get("post_id", "")
+        post_link = (
+            f'<a href="https://www.facebook.com/{pid}" target="_blank" '
+            f'style="color:#60a5fa;text-decoration:none;" title="Xem bài viết">Xem bài ↗</a>'
+            if pid else "—"
+        )
+        cid = h.get("comment_id", "")
+        comment_link = (
+            f'<a href="https://www.facebook.com/{cid}" target="_blank" '
+            f'style="color:#a78bfa;text-decoration:none;" title="Xem comment">Chi tiết ↗</a>'
+            if cid else "—"
+        )
+        history_rows += f"""
+        <tr>
+            <td>{h['time']}</td>
+            <td><strong>{h['commenter']}</strong></td>
+            <td class="comment-cell">{h['comment']}</td>
+            <td class="reply-cell">{h.get('reply', '') or '—'}</td>
+            <td><span class="tag {cls}">{status}</span></td>
+            <td style="font-size:0.75em;color:#888;">{model_short}</td>
+            <td class="mono">{h['elapsed_sec']}s</td>
+            <td>{post_link}</td>
+            <td>{comment_link}</td>
+        </tr>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="3">
+<title>Worker Monitor – FB Auto-Reply Bot</title>
+<style>
+  {SHARED_CSS}
+  .header {{ text-align: center; margin-bottom: 25px; padding-top: 20px; }}
+  .header h1 {{
+    font-size: 1.8em;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 5px;
+  }}
+  .header .subtitle {{ color: #888; font-size: 0.85em; }}
+
+  .status-banner {{
+    background: #1a1a2e;
+    border-radius: 12px;
+    padding: 16px 24px;
+    margin-bottom: 25px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+    border: 1px solid #2a2a4a;
+  }}
+  .status-free {{ border-left: 4px solid #4ade80; }}
+  .status-paid {{ border-left: 4px solid #f87171; }}
+
+  .counters {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 12px;
+    margin-bottom: 25px;
+  }}
+  .counter-card {{
+    background: #1a1a2e;
+    border-radius: 12px;
+    padding: 16px;
+    text-align: center;
+    border: 1px solid #2a2a4a;
+  }}
+  .counter-card .num {{
+    font-size: 2em;
+    font-weight: 700;
+    font-family: monospace;
+  }}
+  .counter-card .lbl {{ color: #888; font-size: 0.75em; text-transform: uppercase; margin-top: 4px; }}
+
+  .current-card {{
+    background: linear-gradient(135deg, #1a1a2e 0%, #252544 100%);
+    border-radius: 14px;
+    padding: 20px;
+    margin-bottom: 25px;
+    border: 1px solid #667eea44;
+    box-shadow: 0 4px 20px rgba(102, 126, 234, 0.15);
+  }}
+  .current-card.idle {{
+    border-color: #2a2a4a;
+    box-shadow: none;
+    background: #1a1a2e;
+  }}
+  .current-header {{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid #2a2a4a;
+    margin-bottom: 12px;
+  }}
+  .current-body .row {{
+    display: flex;
+    gap: 10px;
+    padding: 6px 0;
+    font-size: 0.9em;
+  }}
+  .current-body .label {{
+    color: #888;
+    min-width: 100px;
+    flex-shrink: 0;
+  }}
+  .current-body .value {{ color: #e0e0e0; word-break: break-word; }}
+  .mono {{ font-family: monospace; color: #a78bfa; font-size: 0.85em; }}
+
+  .pulse {{
+    width: 10px;
+    height: 10px;
+    background: #4ade80;
+    border-radius: 50%;
+    animation: pulse 1.5s infinite;
+  }}
+  @keyframes pulse {{
+    0% {{ box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.7); }}
+    70% {{ box-shadow: 0 0 0 10px rgba(74, 222, 128, 0); }}
+    100% {{ box-shadow: 0 0 0 0 rgba(74, 222, 128, 0); }}
+  }}
+  .dot-idle {{
+    width: 10px;
+    height: 10px;
+    background: #555;
+    border-radius: 50%;
+  }}
+
+  .stage-badge {{
+    background: #667eea22;
+    color: #a78bfa;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 0.8em;
+    border: 1px solid #667eea44;
+  }}
+
+  .section {{ margin-bottom: 25px; }}
+  .section h2 {{
+    font-size: 1.05em;
+    color: #a78bfa;
+    margin-bottom: 12px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid #2a2a4a;
+  }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 0.85em; }}
+  th {{
+    background: #16213e;
+    padding: 10px 8px;
+    text-align: left;
+    color: #a78bfa;
+    font-weight: 600;
+  }}
+  td {{ padding: 8px; border-bottom: 1px solid #1a1a2e; }}
+  tr:hover {{ background: #16213e44; }}
+  .comment-cell {{ max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #ccc; }}
+  .reply-cell {{ max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #4ade80; }}
+
+  .tag {{
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 0.8em;
+    font-weight: 600;
+  }}
+  .tag-free {{ background: #4ade8022; color: #4ade80; border: 1px solid #4ade8044; }}
+  .tag-paid {{ background: #f8717122; color: #f87171; border: 1px solid #f8717144; }}
+  .tag-skip {{ background: #fbbf2422; color: #fbbf24; border: 1px solid #fbbf2444; }}
+
+  .auto-refresh {{ color: #555; font-size: 0.75em; text-align: center; margin-top: 20px; }}
+</style>
+</head>
+<body>
+
+{_nav("worker")}
+
+<div class="container">
+
+<div class="header">
+  <h1>🔧 Worker Monitor</h1>
+  <div class="subtitle">Real-time trạng thái comment queue worker – cập nhật {snap['generated_at']}</div>
+</div>
+
+<div class="status-banner {status_class}">
+  <div>
+    <strong>Trạng thái:</strong> {status_label}
+    &nbsp;•&nbsp; Uptime: <span class="mono">{uptime}</span>
+  </div>
+  <div style="color:#888; font-size:0.85em;">
+    Bắt đầu: {started_at}
+  </div>
+</div>
+
+<div class="counters">
+  <div class="counter-card"><div class="num" style="color:#60a5fa;">{counters['in_queue']}</div><div class="lbl">Đang chờ</div></div>
+  <div class="counter-card"><div class="num" style="color:#e0e0e0;">{counters['enqueued']}</div><div class="lbl">Tổng nhận</div></div>
+  <div class="counter-card"><div class="num green">{counters['completed']}</div><div class="lbl">Đã reply</div></div>
+  <div class="counter-card"><div class="num yellow">{counters['skipped']}</div><div class="lbl">Bỏ qua</div></div>
+  <div class="counter-card"><div class="num red">{counters['failed']}</div><div class="lbl">Lỗi</div></div>
+</div>
+
+{current_html}
+
+<div class="section">
+  <h2>📜 Lịch sử {settings.RECENT_COMMENTS_LIMIT} comment gần nhất (hôm nay)</h2>
+  <div style="overflow-x:auto;">
+  <table>
+    <thead>
+      <tr>
+        <th>Giờ</th>
+        <th>Người BL</th>
+        <th>Comment</th>
+        <th>Reply</th>
+        <th>Kết quả</th>
+        <th>Model</th>
+        <th>Thời gian</th>
+        <th>Bài viết</th>
+        <th>Chi tiết</th>
+      </tr>
+    </thead>
+    <tbody>
+      {history_rows if history_rows else '<tr><td colspan="9" style="text-align:center;color:#666;">Chưa có lịch sử</td></tr>'}
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<div class="auto-refresh">
+  Tự động refresh mỗi 3 giây
+  &nbsp;|&nbsp; <a href="/api/worker" style="color:#667eea;">JSON API</a>
+  &nbsp;|&nbsp; <a href="/dashboard" style="color:#667eea;">Dashboard</a>
+</div>
+
+</div>
+</body>
+</html>"""
+    return html
 
 
 @app.get("/dashboard", response_class=HTMLResponse)

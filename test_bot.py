@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 import hmac
 import hashlib
 import unittest
@@ -21,7 +22,8 @@ os.environ["FB_PAGE_ACCESS_TOKEN"] = "MOCK_PAGE_TOKEN_123"
 os.environ["FB_VERIFY_TOKEN"] = "my_secret_verify_token"
 os.environ["FB_APP_SECRET"] = "mock_app_secret_abc"
 os.environ["OPENROUTER_API_KEY"] = "mock_openrouter_key_xyz"
-os.environ["OPENROUTER_MODEL"] = "meta-llama/llama-3.3-70b-instruct:free"
+os.environ["OPENROUTER_MODEL_FREE"] = "meta-llama/llama-3.3-70b-instruct:free"
+os.environ["OPENROUTER_MODEL_PAID"] = "deepseek/deepseek-chat"
 os.environ["REPLY_DELAY_SECONDS"] = "0"  # No delay for tests
 os.environ["GOOGLE_SHEETS_CREDENTIALS"] = "mock_credentials.json"
 os.environ["GOOGLE_SHEET_NAME"] = "Test Sheet"
@@ -290,6 +292,14 @@ class TestFacebookClient(unittest.TestCase):
 class TestOpenRouterClient(unittest.TestCase):
     """Test the openrouter_client module."""
 
+    def setUp(self):
+        from openrouter_client import init_model_manager
+        init_model_manager(
+            free_model="meta-llama/llama-3.3-70b-instruct:free",
+            paid_model="deepseek/deepseek-chat",
+            cooldown_minutes=120,
+        )
+
     def test_generate_reply_success(self):
         from openrouter_client import generate_reply
 
@@ -306,7 +316,6 @@ class TestOpenRouterClient(unittest.TestCase):
 
                 reply = await generate_reply(
                     api_key="test_key",
-                    model="test-model:free",
                     system_prompt="You are helpful.",
                     user_message="Hello",
                 )
@@ -328,7 +337,7 @@ class TestOpenRouterClient(unittest.TestCase):
                 mock_client.return_value = mock_instance
 
                 reply = await generate_reply(
-                    api_key="key", model="m", system_prompt="s", user_message="u"
+                    api_key="key", system_prompt="s", user_message="u"
                 )
                 self.assertIn(reply, FALLBACK_MESSAGE)
 
@@ -353,7 +362,7 @@ class TestOpenRouterClient(unittest.TestCase):
                 mock_client.return_value = mock_instance
 
                 reply = await generate_reply(
-                    api_key="key", model="m", system_prompt="s", user_message="u"
+                    api_key="key", system_prompt="s", user_message="u"
                 )
                 self.assertIn(reply, FALLBACK_MESSAGE)
 
@@ -469,7 +478,7 @@ class TestConfig(unittest.TestCase):
 
         self.assertIn("system_prompt", settings.prompts)
         self.assertIn("reply_instruction", settings.prompts)
-        self.assertIn("quản trị", settings.prompts["system_prompt"])
+        self.assertIn("fanpage", settings.prompts["system_prompt"].lower())
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -498,8 +507,9 @@ class TestWebhookEndpoints(unittest.TestCase):
     def test_health_check(self):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
-        data = response.json()
-        self.assertEqual(data["status"], "running")
+        # Trang chủ giờ trả HTML dark-theme
+        self.assertIn("text/html", response.headers.get("content-type", ""))
+        self.assertIn("FB Auto-Reply Bot", response.text)
 
     def test_webhook_verify_success(self):
         response = self.client.get("/webhook", params=MOCK_WEBHOOK_VERIFY_PARAMS)
@@ -530,6 +540,397 @@ class TestWebhookEndpoints(unittest.TestCase):
         data = response.json()
         self.assertEqual(data["status"], "ignored")
 
+    def test_worker_page_returns_html(self):
+        """Trang /worker trả HTML với các counter và stage label."""
+        response = self.client.get("/worker")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("text/html", response.headers.get("content-type", ""))
+        self.assertIn("Worker Monitor", response.text)
+        self.assertIn("Đang chờ", response.text)
+
+    def test_api_worker_returns_json_snapshot(self):
+        """/api/worker trả JSON với các field bắt buộc."""
+        response = self.client.get("/api/worker")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("worker_running", data)
+        self.assertIn("queue_size", data)
+        self.assertIn("counters", data)
+        self.assertIn("history", data)
+        for key in ("enqueued", "completed", "skipped", "failed", "in_queue"):
+            self.assertIn(key, data["counters"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TEST: Comment Queue (xử lý tuần tự + delay chung react & reply)
+# ═══════════════════════════════════════════════════════════════════════════
+class TestCommentQueue(unittest.TestCase):
+    """Verify queue-based sequential processing và delay behavior."""
+
+    def setUp(self):
+        # ModelManager cần init vì process_comment/generate_reply phụ thuộc
+        from openrouter_client import init_model_manager
+        init_model_manager(
+            free_model="free-m", paid_model="paid-m", cooldown_minutes=120,
+        )
+
+    # ── _fb_delay ───────────────────────────────────────────────────────
+    def test_fb_delay_sleeps_when_configured(self):
+        """_fb_delay thực sự sleep khi REPLY_DELAY_SECONDS > 0."""
+        from main import _fb_delay
+        from config import settings as s
+
+        orig = s.REPLY_DELAY_SECONDS
+        s.REPLY_DELAY_SECONDS = 0.2
+        try:
+            async def run():
+                t0 = time.monotonic()
+                await _fb_delay()
+                return time.monotonic() - t0
+            elapsed = asyncio.run(run())
+            self.assertGreaterEqual(elapsed, 0.18)
+        finally:
+            s.REPLY_DELAY_SECONDS = orig
+
+    def test_fb_delay_skip_when_zero(self):
+        """_fb_delay không sleep khi delay = 0."""
+        from main import _fb_delay
+
+        async def run():
+            t0 = time.monotonic()
+            await _fb_delay()
+            return time.monotonic() - t0
+        self.assertLess(asyncio.run(run()), 0.05)
+
+    # ── process_comment ─────────────────────────────────────────────────
+    def test_process_comment_delays_before_react_and_reply(self):
+        """process_comment gọi _fb_delay 2 lần: trước react và trước reply."""
+        import main as m
+        from config import settings as s
+
+        delay_calls = []
+
+        async def fake_delay():
+            delay_calls.append("delay")
+
+        orig_auto = s.AUTO_LIKE_ENABLED
+        s.AUTO_LIKE_ENABLED = True
+        try:
+            with patch("main._fb_delay", side_effect=fake_delay), \
+                 patch("main.like_comment", AsyncMock(return_value=True)), \
+                 patch("main.reply_comment", AsyncMock(return_value=True)), \
+                 patch("main.get_post_content", AsyncMock(return_value="post content")), \
+                 patch("main.generate_reply", AsyncMock(return_value="reply text")), \
+                 patch("main.should_reply", return_value=(True, "OK")), \
+                 patch("main.sheets", None):
+                asyncio.run(m.process_comment(
+                    page_id=MOCK_PAGE_ID, post_id="999", comment_id="c1",
+                    comment_text="câu hỏi", commenter_id="u1",
+                    commenter_name="User",
+                ))
+        finally:
+            s.AUTO_LIKE_ENABLED = orig_auto
+
+        self.assertEqual(
+            len(delay_calls), 2,
+            "delay phải chạy đúng 2 lần (1 trước react, 1 trước reply)",
+        )
+
+    def test_process_comment_filtered_only_delays_react(self):
+        """Comment bị filter skip → chỉ delay+react, không delay+reply."""
+        import main as m
+        from config import settings as s
+
+        delay_calls = []
+
+        async def fake_delay():
+            delay_calls.append("delay")
+
+        reply_mock = AsyncMock(return_value=True)
+        orig_auto = s.AUTO_LIKE_ENABLED
+        s.AUTO_LIKE_ENABLED = True
+        try:
+            with patch("main._fb_delay", side_effect=fake_delay), \
+                 patch("main.like_comment", AsyncMock(return_value=True)), \
+                 patch("main.reply_comment", reply_mock), \
+                 patch("main.should_reply", return_value=(False, "emoji only")), \
+                 patch("main.sheets", None):
+                asyncio.run(m.process_comment(
+                    page_id=MOCK_PAGE_ID, post_id="999", comment_id="c1",
+                    comment_text="😀", commenter_id="u1", commenter_name="U",
+                ))
+        finally:
+            s.AUTO_LIKE_ENABLED = orig_auto
+
+        self.assertEqual(len(delay_calls), 1, "chỉ được delay 1 lần (react)")
+        reply_mock.assert_not_called()
+
+    def test_process_comment_no_react_when_auto_like_disabled(self):
+        """AUTO_LIKE_ENABLED=False → không delay+react, chỉ delay+reply."""
+        import main as m
+        from config import settings as s
+
+        delay_calls = []
+
+        async def fake_delay():
+            delay_calls.append("delay")
+
+        like_mock = AsyncMock(return_value=True)
+        orig_auto = s.AUTO_LIKE_ENABLED
+        s.AUTO_LIKE_ENABLED = False
+        try:
+            with patch("main._fb_delay", side_effect=fake_delay), \
+                 patch("main.like_comment", like_mock), \
+                 patch("main.reply_comment", AsyncMock(return_value=True)), \
+                 patch("main.get_post_content", AsyncMock(return_value="")), \
+                 patch("main.generate_reply", AsyncMock(return_value="reply")), \
+                 patch("main.should_reply", return_value=(True, "OK")), \
+                 patch("main.sheets", None):
+                asyncio.run(m.process_comment(
+                    page_id=MOCK_PAGE_ID, post_id="999", comment_id="c1",
+                    comment_text="hỏi gì đó", commenter_id="u1",
+                    commenter_name="U",
+                ))
+        finally:
+            s.AUTO_LIKE_ENABLED = orig_auto
+
+        self.assertEqual(len(delay_calls), 1, "chỉ delay 1 lần (reply)")
+        like_mock.assert_not_called()
+
+    # ── Worker sequential processing ────────────────────────────────────
+    def test_worker_processes_queue_sequentially(self):
+        """N comment vào queue cùng lúc → worker xử lý lần lượt, không chồng chéo."""
+        import main as m
+
+        processing_log = []
+
+        async def fake_process(**kw):
+            processing_log.append(("start", kw["comment_id"]))
+            await asyncio.sleep(0.03)
+            processing_log.append(("end", kw["comment_id"]))
+
+        async def run():
+            m.comment_queue = asyncio.Queue()
+            with patch("main.process_comment", side_effect=fake_process):
+                worker = asyncio.create_task(m._comment_worker())
+                for cid in ["c1", "c2", "c3"]:
+                    await m.comment_queue.put({
+                        "page_id": MOCK_PAGE_ID, "post_id": "999",
+                        "comment_id": cid, "comment_text": "x",
+                        "commenter_id": "u", "commenter_name": "U",
+                    })
+                await m.comment_queue.join()
+                worker.cancel()
+                try:
+                    await worker
+                except asyncio.CancelledError:
+                    pass
+
+        asyncio.run(run())
+
+        # Thứ tự phải là: start+end c1, rồi start+end c2, rồi start+end c3
+        self.assertEqual(processing_log, [
+            ("start", "c1"), ("end", "c1"),
+            ("start", "c2"), ("end", "c2"),
+            ("start", "c3"), ("end", "c3"),
+        ])
+
+    def test_worker_no_miss_all_comments_processed(self):
+        """Không miss comment nào – tất cả N item đều được xử lý."""
+        import main as m
+
+        processed = []
+
+        async def fake_process(**kw):
+            processed.append(kw["comment_id"])
+
+        async def run():
+            m.comment_queue = asyncio.Queue()
+            with patch("main.process_comment", side_effect=fake_process):
+                worker = asyncio.create_task(m._comment_worker())
+                ids = [f"c{i}" for i in range(10)]
+                for cid in ids:
+                    await m.comment_queue.put({
+                        "page_id": MOCK_PAGE_ID, "post_id": "999",
+                        "comment_id": cid, "comment_text": "x",
+                        "commenter_id": "u", "commenter_name": "U",
+                    })
+                await m.comment_queue.join()
+                worker.cancel()
+                try:
+                    await worker
+                except asyncio.CancelledError:
+                    pass
+                return ids
+
+        expected_ids = asyncio.run(run())
+        self.assertEqual(processed, expected_ids)
+
+    def test_worker_continues_after_error(self):
+        """1 comment ném exception → worker vẫn xử lý comment tiếp theo."""
+        import main as m
+
+        processed = []
+
+        async def fake_process(**kw):
+            if kw["comment_id"] == "c_bad":
+                raise RuntimeError("simulated failure")
+            processed.append(kw["comment_id"])
+
+        async def run():
+            m.comment_queue = asyncio.Queue()
+            with patch("main.process_comment", side_effect=fake_process):
+                worker = asyncio.create_task(m._comment_worker())
+                for cid in ["c1", "c_bad", "c3"]:
+                    await m.comment_queue.put({
+                        "page_id": MOCK_PAGE_ID, "post_id": "999",
+                        "comment_id": cid, "comment_text": "x",
+                        "commenter_id": "u", "commenter_name": "U",
+                    })
+                await m.comment_queue.join()
+                worker.cancel()
+                try:
+                    await worker
+                except asyncio.CancelledError:
+                    pass
+
+        asyncio.run(run())
+        self.assertEqual(
+            processed, ["c1", "c3"],
+            "c1 và c3 phải được xử lý dù c_bad ném lỗi",
+        )
+
+    # ── Webhook → queue integration ─────────────────────────────────────
+    def test_webhook_enqueues_not_executes_directly(self):
+        """POST webhook → item vào queue (xử lý async, request trả về ngay)."""
+        from fastapi.testclient import TestClient
+        import main as m
+
+        call_args = []
+
+        async def slow_process(**kw):
+            call_args.append(kw)
+            await asyncio.sleep(0.05)
+
+        with patch("main.SheetsLogger"), \
+             patch("main.process_comment", side_effect=slow_process):
+            with TestClient(m.app) as client:
+                response = client.post("/webhook", json=MOCK_WEBHOOK_COMMENT)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["status"], "ok")
+                # Đợi worker tiêu thụ
+                time.sleep(0.2)
+
+        self.assertEqual(len(call_args), 1)
+        self.assertEqual(call_args[0]["comment_id"], "999_888")
+        self.assertEqual(
+            call_args[0]["comment_text"],
+            "Sản phẩm này giá bao nhiêu vậy shop?",
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TEST: worker_state tracking
+# ═══════════════════════════════════════════════════════════════════════════
+class TestWorkerState(unittest.TestCase):
+    """Verify WorkerState track đúng các counter và stage."""
+
+    def setUp(self):
+        from worker_state import WorkerState
+        self.ws = WorkerState()
+
+    def _sample_item(self, cid="c1"):
+        return {
+            "comment_id": cid, "commenter_name": "User",
+            "comment_text": "hello", "post_id": "999",
+        }
+
+    def test_full_lifecycle_completed(self):
+        self.ws.on_worker_start()
+        self.ws.on_enqueue(self._sample_item())
+        self.ws.on_start_processing(self._sample_item())
+        self.ws.set_stage("replying")
+        self.assertEqual(self.ws.current_stage, "replying")
+        self.assertIsNotNone(self.ws.current_item)
+        self.ws.on_complete("đã reply")
+
+        self.assertEqual(self.ws.total_enqueued, 1)
+        self.assertEqual(self.ws.total_completed, 1)
+        self.assertEqual(self.ws.total_skipped, 0)
+        self.assertEqual(self.ws.total_failed, 0)
+        self.assertIsNone(self.ws.current_item)
+        self.assertEqual(self.ws.current_stage, "idle")
+        self.assertEqual(len(self.ws.history), 1)
+        self.assertEqual(self.ws.history[0]["status"], "đã reply")
+
+    def test_skipped_counter(self):
+        self.ws.on_start_processing(self._sample_item())
+        self.ws.on_complete("bỏ qua – emoji")
+        self.assertEqual(self.ws.total_skipped, 1)
+        self.assertEqual(self.ws.total_completed, 0)
+
+    def test_failed_counter(self):
+        self.ws.on_start_processing(self._sample_item())
+        self.ws.on_complete("lỗi – timeout")
+        self.assertEqual(self.ws.total_failed, 1)
+        self.assertEqual(self.ws.total_completed, 0)
+
+    def test_snapshot_includes_queue_size_and_current(self):
+        self.ws.on_worker_start()
+        self.ws.on_start_processing(self._sample_item("c42"))
+        self.ws.set_stage("generating_ai")
+
+        snap = self.ws.snapshot(queue_size=5)
+        self.assertTrue(snap["worker_running"])
+        self.assertEqual(snap["queue_size"], 5)
+        self.assertEqual(snap["counters"]["in_queue"], 5)
+        self.assertIsNotNone(snap["current"])
+        self.assertEqual(snap["current"]["comment_id"], "c42")
+        self.assertEqual(snap["current"]["stage"], "generating_ai")
+        # Label phải được resolve từ STAGES dict
+        self.assertIn("AI", snap["current"]["stage_label"])
+
+    def test_history_capped(self):
+        """History không vượt MAX_HISTORY."""
+        from worker_state import MAX_HISTORY
+        for i in range(MAX_HISTORY + 10):
+            self.ws.on_start_processing(self._sample_item(f"c{i}"))
+            self.ws.on_complete("đã reply")
+        self.assertEqual(len(self.ws.history), MAX_HISTORY)
+
+    def test_day_rollover_resets_history_and_counters(self):
+        """Sang ngày mới → history + counter tự reset về 0 (tiết kiệm bộ nhớ)."""
+        # Ghi vài item ở "hôm qua"
+        self.ws.on_enqueue(self._sample_item("c_yesterday"))
+        self.ws.on_start_processing(self._sample_item("c_yesterday"))
+        self.ws.on_complete("đã reply", reply_text="xin chào", model_used="m1")
+        self.assertEqual(self.ws.total_completed, 1)
+        self.assertEqual(len(self.ws.history), 1)
+
+        # Giả lập sang ngày mới bằng cách đổi _history_date
+        self.ws._history_date = "1970-01-01"
+
+        # Bất kỳ entry point nào cũng trigger rollover
+        self.ws.on_enqueue(self._sample_item("c_today"))
+
+        self.assertEqual(self.ws.total_enqueued, 1, "counter phải reset trước khi +1")
+        self.assertEqual(self.ws.total_completed, 0)
+        self.assertEqual(self.ws.total_skipped, 0)
+        self.assertEqual(self.ws.total_failed, 0)
+        self.assertEqual(len(self.ws.history), 0)
+        self.assertEqual(self.ws._history_date, self.ws._today())
+
+    def test_snapshot_triggers_rollover(self):
+        """Chỉ call snapshot (không có enqueue/complete) cũng phải rollover."""
+        self.ws.on_start_processing(self._sample_item("c1"))
+        self.ws.on_complete("đã reply")
+        self.assertEqual(len(self.ws.history), 1)
+
+        self.ws._history_date = "1970-01-01"
+        snap = self.ws.snapshot(queue_size=0)
+        self.assertEqual(snap["counters"]["completed"], 0)
+        self.assertEqual(len(snap["history"]), 0)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN: Run tests and generate report
@@ -546,6 +947,8 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(TestConfig))
     suite.addTests(loader.loadTestsFromTestCase(TestSheetsLogger))
     suite.addTests(loader.loadTestsFromTestCase(TestWebhookEndpoints))
+    suite.addTests(loader.loadTestsFromTestCase(TestCommentQueue))
+    suite.addTests(loader.loadTestsFromTestCase(TestWorkerState))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

@@ -5,11 +5,13 @@ Bot Python tự động trả lời comment trên fanpage Facebook sử dụng A
 ## 🤖 Tính năng
 - **Tự động trả lời:** Sử dụng AI từ OpenRouter (hỗ trợ nhiều model miễn phí và trả phí).
 - **Auto-Switch Model:** Ưu tiên model miễn phí, tự động chuyển sang model trả phí khi bị rate limit, và tự thử lại free sau mỗi 2 tiếng.
-- **Auto Like/React Comment:** Tự động Like hoặc React (LOVE, HAHA, WOW, SAD, ANGRY) mọi comment mới, thực hiện ngay lập tức trước khi reply.
-- **Dashboard trực quan:** Trang chủ và Dashboard dark-theme hiển thị thống kê model usage, lịch sử switch, 10–20 comment gần nhất với link bài viết.
+- **Auto Like/React Comment:** Tự động Like hoặc React (LOVE, HAHA, WOW, SAD, ANGRY) mọi comment mới.
+- **Queue tuần tự chống spam:** Mọi comment được đưa vào hàng đợi FIFO, xử lý lần lượt bởi 1 worker duy nhất. Delay `REPLY_DELAY_SECONDS` áp dụng **chung cho cả react và reply** → không bao giờ bắn nhiều request FB cùng lúc (tránh bị đánh dấu spam khi nhận comment dồn).
+- **Worker Monitor real-time:** Trang `/worker` theo dõi trực tiếp comment đang xử lý, stage hiện tại (react/filter/AI/reply), elapsed time, counter (đang chờ / đã reply / bỏ qua / lỗi) và lịch sử comment trong ngày.
+- **Dashboard trực quan:** Trang chủ và Dashboard dark-theme hiển thị thống kê model usage, lịch sử switch, comment gần nhất với link bài viết.
+- **Auto reset theo ngày:** Counter và history của worker + recent comments tự reset 00:00 mỗi ngày để tiết kiệm bộ nhớ.
 - **Lọc comment thông minh:** Tự động bỏ qua emoji, comment quá ngắn hoặc comment trùng lặp.
 - **Lọc reasoning AI:** Tự động loại bỏ phần suy luận tiếng Anh của AI, chỉ giữ câu trả lời tiếng Việt.
-- **Delay thông minh:** Cấu hình thời gian chờ giữa các lần reply để tránh bị Facebook đánh dấu spam.
 - **Ghi log chuyên nghiệp:** Lưu lịch sử comment, reply và trạng thái like vào Google Sheets.
 - **Tùy chỉnh Prompt:** Dễ dàng thay đổi "tính cách" của bot qua file `prompts.json`.
 
@@ -40,10 +42,10 @@ cp .env.example .env
 | `MODEL_FALLBACK_COOLDOWN` | Thời gian chờ trước khi thử lại model free, tính bằng phút (Mặc định: `120`) |
 | `GOOGLE_SHEETS_CREDENTIALS` | Tên file JSON key (Mặc định: `credentials.json`) |
 | `GOOGLE_SHEET_NAME` | Tên file Google Sheet để ghi log |
-| `REPLY_DELAY_SECONDS` | Thời gian chờ giữa các reply (giây) |
+| `REPLY_DELAY_SECONDS` | Thời gian chờ trước **mỗi** FB API call (react & reply). Rate-limit: 1 action / N giây (Mặc định: `5`) |
 | `AUTO_LIKE_ENABLED` | Bật/tắt Auto Like (Mặc định: `true`) |
 | `AUTO_LIKE_REACTION_TYPE` | Loại reaction: `LIKE`, `LOVE`, `HAHA`, `WOW`, `SAD`, `ANGRY` (Mặc định: `LIKE`) |
-| `RECENT_COMMENTS_LIMIT` | Số comment gần nhất hiển trên trang chủ (Mặc định: `10`) |
+| `RECENT_COMMENTS_LIMIT` | Số comment gần nhất hiển thị trên trang chủ & worker page (Mặc định: `10`) |
 
 ---
 
@@ -83,6 +85,47 @@ Comment mới → Gọi Model FREE
 > **Bot không bao giờ bỏ sót comment.** Nếu cả FREE lẫn PAID đều fail, bot sẽ reply bằng 1 câu ngẫu nhiên từ danh sách ~70 fallback message (cảm ơn + mời follow page) đã cấu hình sẵn trong `openrouter_client.py`.
 
 **Monitoring:** Truy cập `http://localhost:8686/dashboard` để xem thống kê model usage theo ngày và lịch sử switch.
+
+---
+
+## ⚙️ Cơ chế Queue & Worker (chống spam)
+
+Để tránh bị Facebook đánh dấu là bot/spam khi nhận nhiều comment dồn dập, bot dùng kiến trúc **single-worker FIFO queue**:
+
+```
+Webhook ──► comment_queue.put(item)  (trả 200 OK ngay, <1s)
+                   │
+                   ▼
+            [ asyncio.Queue ]
+                   │
+                   ▼
+   ┌─── 1 Worker duy nhất (xử lý tuần tự) ───┐
+   │                                          │
+   │   delay → react                          │
+   │   filter                                 │
+   │   fetch post                             │
+   │   AI generate                            │
+   │   delay → reply                          │
+   │   log (Sheets + Stats)                   │
+   └──────────────────────────────────────────┘
+```
+
+### Đặc điểm
+- **Tuần tự tuyệt đối:** 1 worker pop 1 item → xử lý xong mới pop tiếp. Không có chuyện 10 comment cùng react/reply một lúc.
+- **Delay chung:** `REPLY_DELAY_SECONDS` áp dụng trước **cả react và reply**. Rate effective: tối đa 1 FB API call / N giây.
+- **Không miss comment:** queue không giới hạn, lỗi 1 comment không chết worker (comment kế tiếp vẫn được xử lý).
+- **Quick-ack webhook:** request từ FB trả 200 OK ngay, xử lý thực tế chạy nền → FB không retry.
+
+### Worker Monitor (`/worker`)
+
+Trang real-time (auto refresh 3s) hiển thị:
+- 🟢 Status worker (Running/Stopped) + uptime + số comment đang chờ trong queue
+- **Item đang xử lý:** commenter, comment text, stage hiện tại (react/filter/AI/reply/log), elapsed time
+- **Counter ngày:** Đang chờ / Tổng nhận / Đã reply / Bỏ qua / Lỗi (tự reset 00:00 mỗi ngày)
+- **Lịch sử hôm nay:** N comment gần nhất (theo `RECENT_COMMENTS_LIMIT`) kèm reply, model, link bài viết + link comment
+
+> [!TIP]
+> Nếu vẫn bị FB cảnh báo spam, **tăng `REPLY_DELAY_SECONDS` lên 10–15s**. Ví dụ `REPLY_DELAY_SECONDS=10` → tối đa 6 action/phút.
 
 ---
 
@@ -137,8 +180,10 @@ ngrok http 8686
 |---|---|
 | `GET /` | 🏠 Trang chủ trực quan – trạng thái bot, cấu hình, uptime, comment gần nhất |
 | `GET /dashboard` | 📊 Dashboard – thống kê model usage theo ngày, lịch sử switch |
+| `GET /worker` | 🔧 Worker Monitor – real-time item đang xử lý, stage, queue, lịch sử trong ngày |
 | `GET /model-status` | Xem trạng thái model (free/paid, thời gian switch, số lần fail) |
 | `GET /api/stats` | JSON API – toàn bộ dữ liệu thống kê (daily summary + switch history + comments) |
+| `GET /api/worker` | JSON API – snapshot real-time trạng thái worker (current, counters, history) |
 | `GET /webhook` | Facebook webhook verification |
 | `POST /webhook` | Nhận sự kiện comment từ Facebook |
 
@@ -167,12 +212,14 @@ ngrok http 8686
 ---
 
 ## 📂 Cấu trúc thư mục
-- `main.py`: Server chính xử lý webhook + Trang chủ + Dashboard + API.
+- `main.py`: Server FastAPI – webhook, comment queue + worker, Trang chủ, Dashboard, Worker Monitor, API.
 - `config.py`: Quản lý cấu hình và biến môi trường.
 - `prompts.json`: Nơi tùy chỉnh nội dung AI trả lời.
-- `facebook_client.py`: Các hàm tương tác với Facebook Graph API (reply, like/react).
-- `openrouter_client.py`: Kết nối API AI + ModelManager (auto-switch free/paid).
-- `model_stats.py`: Thống kê model usage + recent comments theo ngày, lưu vào `model_stats.json`.
+- `facebook_client.py`: Các hàm tương tác với Facebook Graph API (reply, like/react, get post, verify signature).
+- `openrouter_client.py`: Kết nối OpenRouter API + `ModelManager` (auto-switch free/paid) + lọc reasoning.
+- `model_stats.py`: Thống kê model usage + recent comments theo ngày, persist vào `model_stats.json`.
+- `worker_state.py`: Tracker real-time trạng thái worker (current item, stage, counter, history) – auto reset theo ngày.
 - `sheets_logger.py`: Xử lý ghi log vào Google Sheets.
-- `comment_filter.py`: Bộ lọc thông minh cho bình luận.
+- `comment_filter.py`: Bộ lọc thông minh cho bình luận (emoji-only, quá ngắn, đã reply, self-Page).
+- `test_bot.py`: Bộ test toàn diện (45 test) cho tất cả module.
 - `.gitignore`: Bỏ qua các file nhạy cảm: `.env`, `credentials.json`, `model_stats.json`.
