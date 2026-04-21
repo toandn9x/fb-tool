@@ -21,6 +21,34 @@ EMOJI_ONLY_PATTERN = re.compile(
 MIN_COMMENT_LENGTH = 2
 
 
+def fast_filter(
+    comment_text: str,
+    commenter_id: str,
+    page_id: str,
+) -> tuple[bool, str]:
+    """
+    Bộ lọc sync – không phụ thuộc Google Sheets, chạy được ngay trong webhook
+    để bypass queue với những comment không cần reply.
+
+    Kiểm tra: self-Page, rỗng, quá ngắn, chỉ emoji.
+    """
+    if commenter_id == page_id:
+        return False, "comment từ chính Page"
+
+    if not comment_text or not comment_text.strip():
+        return False, "comment rỗng hoặc chỉ có media"
+
+    text = comment_text.strip()
+
+    if len(text) < MIN_COMMENT_LENGTH:
+        return False, f"comment quá ngắn ({len(text)} ký tự)"
+
+    if EMOJI_ONLY_PATTERN.match(text):
+        return False, "comment chỉ có emoji"
+
+    return True, "OK"
+
+
 def should_reply(
     comment_text: str,
     commenter_id: str,
@@ -30,6 +58,7 @@ def should_reply(
 ) -> tuple[bool, str]:
     """
     Determine if the bot should reply to this comment.
+    = fast_filter + dedup qua Google Sheets (dùng trong worker).
 
     Args:
         comment_text: The comment message text
@@ -41,23 +70,10 @@ def should_reply(
     Returns:
         Tuple of (should_reply: bool, reason: str)
     """
-    # 1. Skip comments from the Page itself (avoid infinite loop)
-    if commenter_id == page_id:
-        return False, "comment từ chính Page"
-
-    # 2. Skip empty or missing text
-    if not comment_text or not comment_text.strip():
-        return False, "comment rỗng hoặc chỉ có media"
-
-    text = comment_text.strip()
-
-    # 3. Skip very short comments
-    if len(text) < MIN_COMMENT_LENGTH:
-        return False, f"comment quá ngắn ({len(text)} ký tự)"
-
-    # 4. Skip emoji-only comments
-    if EMOJI_ONLY_PATTERN.match(text):
-        return False, "comment chỉ có emoji"
+    # 1-4. Tái sử dụng fast filter
+    ok, reason = fast_filter(comment_text, commenter_id, page_id)
+    if not ok:
+        return False, reason
 
     # 5. Skip already-replied comments (check Google Sheets)
     if sheets_logger and sheets_logger.is_already_replied(comment_id):

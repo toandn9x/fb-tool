@@ -137,6 +137,34 @@ class WorkerState:
         self.current_stage_started_at = None
         self.current_stage = "idle"
 
+    # ── Fast-path cho comment bị filter ngay ở webhook ──────────────────
+    def record_skipped_fast(
+        self,
+        item: dict,
+        reason: str,
+        like_status: str = "",
+    ):
+        """
+        Ghi nhận comment bị fast-filter (không qua queue/worker).
+        Tăng total_skipped + đẩy vào history để hiển thị ở trang /worker.
+        Không đụng đến current_item (worker vẫn có thể đang chạy item khác).
+        """
+        self._check_day_rollover()
+        self.total_skipped += 1
+        self.history.append({
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "comment_id": item.get("comment_id", ""),
+            "commenter": item.get("commenter_name", ""),
+            "comment": item.get("comment_text", "")[:150],
+            "reply": "",
+            "model": "",
+            "post_id": item.get("post_id", ""),
+            "status": f"bỏ qua – {reason}",
+            "elapsed_sec": 0,
+        })
+        if len(self.history) > MAX_HISTORY:
+            self.history = self.history[-MAX_HISTORY:]
+
     # ── Snapshot cho dashboard/API ──────────────────────────────────────
     def snapshot(self, queue_size: int = 0, history_limit: int = 20) -> dict:
         self._check_day_rollover()

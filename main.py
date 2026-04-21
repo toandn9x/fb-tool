@@ -11,7 +11,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 
 from config import settings
-from comment_filter import should_reply
+from comment_filter import should_reply, fast_filter
 from openrouter_client import generate_reply, init_model_manager, model_manager
 from facebook_client import reply_comment, like_comment, get_post_content, verify_signature
 from sheets_logger import SheetsLogger
@@ -30,12 +30,27 @@ logger = logging.getLogger("bot")
 sheets: SheetsLogger | None = None
 comment_queue: asyncio.Queue | None = None
 _worker_task: asyncio.Task | None = None
+_flush_task: asyncio.Task | None = None
+
+
+async def _periodic_flush_stats():
+    """
+    Background task: flush debounced writes của model_stats mỗi 5 giây.
+    Bảo đảm update cuối không bị kẹt trong memory quá lâu.
+    """
+    from model_stats import stats as _model_stats
+    while True:
+        await asyncio.sleep(5)
+        try:
+            _model_stats.flush()
+        except Exception as e:
+            logger.error(f"Periodic flush error: {e}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown events."""
-    global sheets, comment_queue, _worker_task
+    global sheets, comment_queue, _worker_task, _flush_task
     try:
         sheets = SheetsLogger(
             credentials_path=settings.GOOGLE_SHEETS_CREDENTIALS,
@@ -77,6 +92,7 @@ async def lifespan(app: FastAPI):
     # Khởi tạo queue + worker xử lý comment tuần tự
     comment_queue = asyncio.Queue()
     _worker_task = asyncio.create_task(_comment_worker())
+    _flush_task = asyncio.create_task(_periodic_flush_stats())
     logger.info("Comment queue worker started (xử lý tuần tự)")
 
     # ── Recovery: nạp lại các comment chưa xử lý từ lần chạy trước ───
@@ -99,6 +115,18 @@ async def lifespan(app: FastAPI):
             except (asyncio.CancelledError, Exception):
                 pass
             logger.info("Comment queue worker stopped")
+        if _flush_task:
+            _flush_task.cancel()
+            try:
+                await _flush_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        # Final flush – đảm bảo mọi debounced update được ghi xuống đĩa
+        try:
+            from model_stats import stats as _model_stats
+            _model_stats.flush()
+        except Exception as e:
+            logger.error(f"Final flush error: {e}")
 
 
 app = FastAPI(title="FB Auto-Reply Bot", lifespan=lifespan)
@@ -165,7 +193,6 @@ async def webhook_handler(request: Request):
                 f"{comment_text[:50]}..."
             )
 
-            # Enqueue – worker sẽ xử lý tuần tự, không miss comment nào
             if comment_queue is not None:
                 item = {
                     "page_id": page_id,
@@ -175,8 +202,31 @@ async def webhook_handler(request: Request):
                     "commenter_id": commenter_id,
                     "commenter_name": commenter_name,
                 }
-                # Persist vào DB trước khi đưa vào in-memory queue.
-                # INSERT OR IGNORE → tự bỏ qua nếu là duplicate webhook.
+
+                # ── Fast-filter TRƯỚC khi enqueue ────────────────────────
+                # Comment bị lọc (emoji/ngắn/self-page) → không đẩy vào
+                # queue, chỉ like + log async (bypass rate limit).
+                passes, fast_reason = fast_filter(
+                    comment_text=comment_text,
+                    commenter_id=commenter_id,
+                    page_id=page_id,
+                )
+                if not passes:
+                    newly = queue_db.save_filtered(item)
+                    if newly:
+                        logger.info(
+                            f"Fast-filter skip {comment_id}: {fast_reason}"
+                        )
+                        asyncio.create_task(
+                            _handle_filtered_comment(item, fast_reason)
+                        )
+                    else:
+                        logger.info(
+                            f"Duplicate filtered webhook, bỏ qua {comment_id}"
+                        )
+                    continue
+
+                # ── Item hợp lệ → persist + enqueue bình thường ──────────
                 saved = queue_db.save_pending(item)
                 if not saved:
                     logger.info(
@@ -220,12 +270,112 @@ async def _comment_worker():
             comment_queue.task_done()
 
 
+async def _handle_filtered_comment(item: dict, reason: str):
+    """
+    Fast-path cho comment bị fast-filter: chỉ like + log Sheets, KHÔNG qua
+    queue/worker. Fire-and-forget – không block webhook response.
+    """
+    like_status = ""
+    if settings.AUTO_LIKE_ENABLED:
+        try:
+            reaction = settings.AUTO_LIKE_REACTION_TYPE
+            liked = await like_comment(
+                comment_id=item["comment_id"],
+                access_token=settings.FB_PAGE_ACCESS_TOKEN,
+                reaction_type=reaction,
+            )
+            like_status = f"đã {reaction}" if liked else f"lỗi {reaction}"
+            logger.info(
+                f"Fast-react {item['comment_id']}: {like_status}"
+            )
+        except Exception as e:
+            logger.error(f"Fast-react error: {e}")
+            like_status = "lỗi react"
+
+    await _sheets_log(
+        post_id=item["post_id"],
+        comment_id=item["comment_id"],
+        commenter_name=item["commenter_name"],
+        comment_text=item["comment_text"],
+        reply_text="",
+        status=f"bỏ qua – {reason}",
+        like_status=like_status,
+    )
+
+    # Hiển thị trong history /worker mà không đụng tới current_item
+    worker_state.record_skipped_fast(item, reason, like_status)
+
+
 async def _fb_delay():
     """Delay chung trước mỗi lần gọi Facebook API (react / reply)."""
     delay = settings.REPLY_DELAY_SECONDS
     if delay > 0:
         logger.info(f"Chờ {delay}s trước FB action...")
         await asyncio.sleep(delay)
+
+
+# ── Post content cache (TTL) ─────────────────────────────────────────────
+# Nhiều comment trên cùng 1 post → chỉ fetch nội dung bài 1 lần trong N giây.
+# Giảm số call FB Graph API → nhanh hơn + tránh rate limit.
+import time as _time_mod
+_POST_CACHE_TTL = 300  # 5 phút
+_post_cache: dict[str, tuple[str, float]] = {}
+
+
+async def _get_post_cached(post_id: str) -> str:
+    """Fetch post content với cache TTL 5 phút (per post_id)."""
+    now = _time_mod.time()
+    cached = _post_cache.get(post_id)
+    if cached and (now - cached[1]) < _POST_CACHE_TTL:
+        return cached[0]
+    content = await get_post_content(post_id, settings.FB_PAGE_ACCESS_TOKEN)
+    _post_cache[post_id] = (content, now)
+    # Giữ cache nhỏ – purge entry quá cũ khi vượt 100 post
+    if len(_post_cache) > 100:
+        cutoff = now - _POST_CACHE_TTL
+        for pid in [k for k, (_, t) in _post_cache.items() if t < cutoff]:
+            _post_cache.pop(pid, None)
+    return content
+
+
+# ── Sheets helpers (async wrapper qua thread pool + timeout) ────────────
+# gspread sync → `asyncio.to_thread` không block event loop, `wait_for` cắt
+# call khi Sheets treo. Mọi exception đều nuốt gọn → bot vẫn reply bình
+# thường khi Sheets sập (tầng 1 dedup qua SQLite vẫn bảo vệ double-reply).
+_SHEETS_TIMEOUT = 15.0  # giây – trên mức bình thường 1–5s, dưới mức treo
+
+
+async def _sheets_log(**kwargs):
+    if not sheets:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(sheets.log_comment, **kwargs),
+            timeout=_SHEETS_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"Sheets log timeout sau {_SHEETS_TIMEOUT}s – bỏ qua")
+    except Exception as e:
+        logger.error(f"Sheets log error: {e}")
+
+
+async def _sheets_is_replied(comment_id: str) -> bool:
+    if not sheets:
+        return False
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(sheets.is_already_replied, comment_id),
+            timeout=_SHEETS_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.error(
+            f"Sheets is_replied timeout sau {_SHEETS_TIMEOUT}s – "
+            f"fallback: dùng dedup SQLite duy nhất"
+        )
+        return False
+    except Exception as e:
+        logger.error(f"Sheets is_replied error: {e}")
+        return False
 
 
 # ── Comment Processing ──────────────────────────────────────────────────
@@ -257,37 +407,39 @@ async def process_comment(
             like_status = f"đã {reaction}" if liked else f"lỗi {reaction}"
             logger.info(f"Auto-react {comment_id}: {like_status}")
 
-        # 2. Filter
+        # 2. Filter (sync) + dedup 2 tầng (SQLite local rồi Sheets fallback)
         worker_state.set_stage("filtering")
-        ok, reason = should_reply(
+        ok, reason = fast_filter(
             comment_text=comment_text,
             commenter_id=commenter_id,
             page_id=page_id,
-            comment_id=comment_id,
-            sheets_logger=sheets,
         )
+        if ok:
+            # Tầng 1: SQLite local (<1ms, bulletproof qua crash)
+            if queue_db.is_replied(comment_id):
+                ok, reason = False, "đã reply trước đó (local)"
+            # Tầng 2: Sheets full-scan qua thread pool (fallback, 1–5s)
+            elif sheets and await _sheets_is_replied(comment_id):
+                ok, reason = False, "đã reply trước đó"
 
         if not ok:
             logger.info(f"Skipped comment {comment_id}: {reason}")
             worker_state.set_stage("logging")
-            if sheets:
-                sheets.log_comment(
-                    post_id=post_id,
-                    comment_id=comment_id,
-                    commenter_name=commenter_name,
-                    comment_text=comment_text,
-                    reply_text="",
-                    status=f"bỏ qua – {reason}",
-                    like_status=like_status,
-                )
+            await _sheets_log(
+                post_id=post_id,
+                comment_id=comment_id,
+                commenter_name=commenter_name,
+                comment_text=comment_text,
+                reply_text="",
+                status=f"bỏ qua – {reason}",
+                like_status=like_status,
+            )
             worker_state.on_complete(f"bỏ qua – {reason}")
             return
 
-        # 3. Fetch post content for context
+        # 3. Fetch post content for context (có cache TTL)
         worker_state.set_stage("fetching_post")
-        post_content = await get_post_content(
-            post_id, settings.FB_PAGE_ACCESS_TOKEN
-        )
+        post_content = await _get_post_cached(post_id)
 
         # 4. Build prompt
         prompts = settings.prompts
@@ -317,19 +469,23 @@ async def process_comment(
             access_token=settings.FB_PAGE_ACCESS_TOKEN,
         )
 
-        # 7. Log to Google Sheets
+        # Mark local dedup NGAY khi FB xác nhận OK – nếu crash trước khi
+        # mark_done vẫn chặn được double-reply ở lần recovery tiếp theo.
+        if success:
+            queue_db.mark_replied(comment_id)
+
+        # 7. Log to Google Sheets (async qua thread pool)
         worker_state.set_stage("logging")
         status = "đã reply" if success else "lỗi"
-        if sheets:
-            sheets.log_comment(
-                post_id=post_id,
-                comment_id=comment_id,
-                commenter_name=commenter_name,
-                comment_text=comment_text,
-                reply_text=reply_text,
-                status=status,
-                like_status=like_status,
-            )
+        await _sheets_log(
+            post_id=post_id,
+            comment_id=comment_id,
+            commenter_name=commenter_name,
+            comment_text=comment_text,
+            reply_text=reply_text,
+            status=status,
+            like_status=like_status,
+        )
 
         # 8. Ghi vào recent comments (cho homepage)
         from model_stats import stats as model_stats_inst
@@ -354,16 +510,15 @@ async def process_comment(
 
     except Exception as e:
         logger.error(f"Error processing comment {comment_id}: {e}")
-        if sheets:
-            sheets.log_comment(
-                post_id=post_id,
-                comment_id=comment_id,
-                commenter_name=commenter_name,
-                comment_text=comment_text,
-                reply_text="",
-                status=f"lỗi – {e}",
-                like_status=like_status,
-            )
+        await _sheets_log(
+            post_id=post_id,
+            comment_id=comment_id,
+            commenter_name=commenter_name,
+            comment_text=comment_text,
+            reply_text="",
+            status=f"lỗi – {e}",
+            like_status=like_status,
+        )
         worker_state.on_complete(f"lỗi – {e}")
 
 # ── Shared ───────────────────────────────────────────────────────────────
@@ -846,7 +1001,13 @@ async def worker_page():
     # Tính số liệu cho Progress section
     enq = counters["enqueued"]
     done = counters["total_done"]
-    done_pct = (done / enq * 100) if enq > 0 else 0
+    in_flight = counters["in_flight"]
+    in_queue = counters["in_queue"]
+    # Mẫu số lớn nhất giữa (đã nhận hôm nay) và (tổng đang hiện diện trong
+    # hệ thống). Tránh % > 100 khi day rollover reset enqueued lúc 00:00
+    # nhưng item carry-over từ hôm qua vẫn hoàn tất hôm nay → done > enq.
+    total_for_pct = max(enq, done + in_flight + in_queue)
+    done_pct = (done / total_for_pct * 100) if total_for_pct > 0 else 0
     reply_pct = (
         counters["completed"] / done * 100 if done > 0 else 0
     )
@@ -1296,25 +1457,25 @@ async def worker_page():
       <strong>Tiến độ hôm nay</strong>
       <span class="progress-math">
         Nhận <strong style="color:#e0e0e0;">{enq}</strong>
-        = Xong <strong class="green">{done}</strong>
-        + Đang xử lý <strong style="color:#a78bfa;">{counters['in_flight']}</strong>
-        + Chờ <strong style="color:#60a5fa;">{counters['in_queue']}</strong>
+        &nbsp;·&nbsp; Xong <strong class="green">{done}</strong>
+        &nbsp;·&nbsp; Đang xử lý <strong style="color:#a78bfa;">{in_flight}</strong>
+        &nbsp;·&nbsp; Chờ <strong style="color:#60a5fa;">{in_queue}</strong>
       </span>
     </div>
-    <div class="progress-pct-label">{done_pct:.0f}% &nbsp;<span style="color:#666;">({done}/{enq})</span></div>
+    <div class="progress-pct-label">{done_pct:.0f}% &nbsp;<span style="color:#666;">({done}/{total_for_pct})</span></div>
   </div>
   <div class="progress-bar-wrap">
-    <div class="progress-seg green-bar" style="width:{(counters['completed']/enq*100) if enq else 0:.2f}%" title="Đã reply: {counters['completed']}"></div>
-    <div class="progress-seg yellow-bar" style="width:{(counters['skipped']/enq*100) if enq else 0:.2f}%" title="Bỏ qua: {counters['skipped']}"></div>
-    <div class="progress-seg red-bar" style="width:{(counters['failed']/enq*100) if enq else 0:.2f}%" title="Lỗi: {counters['failed']}"></div>
-    <div class="progress-seg inflight-bar" style="width:{(counters['in_flight']/enq*100) if enq else 0:.2f}%" title="Đang xử lý: {counters['in_flight']}"></div>
+    <div class="progress-seg green-bar" style="width:{(counters['completed']/total_for_pct*100) if total_for_pct else 0:.2f}%" title="Đã reply: {counters['completed']}"></div>
+    <div class="progress-seg yellow-bar" style="width:{(counters['skipped']/total_for_pct*100) if total_for_pct else 0:.2f}%" title="Bỏ qua: {counters['skipped']}"></div>
+    <div class="progress-seg red-bar" style="width:{(counters['failed']/total_for_pct*100) if total_for_pct else 0:.2f}%" title="Lỗi: {counters['failed']}"></div>
+    <div class="progress-seg inflight-bar" style="width:{(in_flight/total_for_pct*100) if total_for_pct else 0:.2f}%" title="Đang xử lý: {in_flight}"></div>
   </div>
   <div class="progress-legend">
     <span><span class="dot green-dot"></span>Reply {counters['completed']} ({reply_pct:.0f}%)</span>
     <span><span class="dot yellow-dot"></span>Skip {counters['skipped']} ({skip_pct:.0f}%)</span>
     <span><span class="dot red-dot"></span>Lỗi {counters['failed']} ({fail_pct:.0f}%)</span>
-    <span><span class="dot inflight-dot"></span>In-flight {counters['in_flight']}</span>
-    <span><span class="dot queue-dot"></span>Chờ {counters['in_queue']}</span>
+    <span><span class="dot inflight-dot"></span>In-flight {in_flight}</span>
+    <span><span class="dot queue-dot"></span>Chờ {in_queue}</span>
   </div>
 </div>
 

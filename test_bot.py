@@ -184,6 +184,23 @@ class TestCommentFilter(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("emoji", reason)
 
+    def test_fast_filter_page_self(self):
+        from comment_filter import fast_filter
+        ok, reason = fast_filter("Cảm ơn", MOCK_PAGE_ID, MOCK_PAGE_ID)
+        self.assertFalse(ok)
+        self.assertIn("chính Page", reason)
+
+    def test_fast_filter_emoji_only(self):
+        from comment_filter import fast_filter
+        ok, reason = fast_filter("😀👍", "USER_1", MOCK_PAGE_ID)
+        self.assertFalse(ok)
+        self.assertIn("emoji", reason)
+
+    def test_fast_filter_valid_comment(self):
+        from comment_filter import fast_filter
+        ok, reason = fast_filter("Sản phẩm giá bao nhiêu?", "USER_1", MOCK_PAGE_ID)
+        self.assertTrue(ok)
+
     def test_already_replied_rejected(self):
         mock_sheets = MagicMock()
         mock_sheets.is_already_replied.return_value = True
@@ -821,8 +838,17 @@ class TestCommentQueue(unittest.TestCase):
             call_args.append(kw)
             await asyncio.sleep(0.05)
 
+        # Mock queue_db để test không phụ thuộc SQLite thực tế (tránh nạp
+        # lại item cũ từ DB khi lifespan chạy load_unfinished).
         with patch("main.SheetsLogger"), \
-             patch("main.process_comment", side_effect=slow_process):
+             patch("main.process_comment", side_effect=slow_process), \
+             patch("main.queue_db.init_db"), \
+             patch("main.queue_db.cleanup_old_done"), \
+             patch("main.queue_db.load_unfinished", return_value=[]), \
+             patch("main.queue_db.save_pending", return_value=True), \
+             patch("main.queue_db.save_filtered", return_value=True), \
+             patch("main.queue_db.mark_processing"), \
+             patch("main.queue_db.mark_done"):
             with TestClient(m.app) as client:
                 response = client.post("/webhook", json=MOCK_WEBHOOK_COMMENT)
                 self.assertEqual(response.status_code, 200)
@@ -836,6 +862,53 @@ class TestCommentQueue(unittest.TestCase):
             call_args[0]["comment_text"],
             "Sản phẩm này giá bao nhiêu vậy shop?",
         )
+
+    def test_webhook_emoji_bypasses_queue(self):
+        """Comment chỉ có emoji: fast-filter → KHÔNG enqueue, chỉ like."""
+        from fastapi.testclient import TestClient
+        import main as m
+
+        process_calls = []
+        like_calls = []
+
+        async def fake_process(**kw):
+            process_calls.append(kw)
+
+        async def fake_like(**kw):
+            like_calls.append(kw)
+            return True
+
+        fake_ws = MagicMock()
+
+        with patch("main.SheetsLogger"), \
+             patch("main.process_comment", side_effect=fake_process), \
+             patch("main.like_comment", side_effect=fake_like), \
+             patch("main.worker_state", fake_ws), \
+             patch("main.queue_db.init_db"), \
+             patch("main.queue_db.cleanup_old_done"), \
+             patch("main.queue_db.load_unfinished", return_value=[]), \
+             patch("main.queue_db.save_pending") as mock_save_pending, \
+             patch("main.queue_db.save_filtered", return_value=True) as mock_save_filtered, \
+             patch("main.queue_db.mark_processing"), \
+             patch("main.queue_db.mark_done"):
+            with TestClient(m.app) as client:
+                response = client.post(
+                    "/webhook", json=MOCK_WEBHOOK_EMOJI_COMMENT
+                )
+                self.assertEqual(response.status_code, 200)
+                time.sleep(0.15)  # đợi fire-and-forget
+
+        # process_comment KHÔNG được gọi (bypass queue)
+        self.assertEqual(len(process_calls), 0)
+        # save_pending KHÔNG được gọi, save_filtered mới được gọi
+        mock_save_pending.assert_not_called()
+        mock_save_filtered.assert_called_once()
+        # like_comment ĐƯỢC gọi (fast-path vẫn like)
+        self.assertEqual(len(like_calls), 1)
+        # worker_state.record_skipped_fast được gọi
+        fake_ws.record_skipped_fast.assert_called_once()
+        # worker_state.on_enqueue KHÔNG được gọi (không vào queue)
+        fake_ws.on_enqueue.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -980,6 +1053,157 @@ class TestWorkerState(unittest.TestCase):
             snap["current"]["elapsed_sec"],
         )
 
+    def test_record_skipped_fast_adds_history_without_touching_current(self):
+        """Fast-path skip: tăng counter + history, KHÔNG ghi đè current_item."""
+        # Worker đang xử lý c_running (in-flight)
+        self.ws.on_start_processing(self._sample_item("c_running"))
+        self.assertIsNotNone(self.ws.current_item)
+
+        # Parallel: fast-filter skip 1 comment khác
+        fast_item = {
+            "comment_id": "c_fast",
+            "commenter_name": "Emoji User",
+            "comment_text": "😀😀",
+            "post_id": "999",
+        }
+        self.ws.record_skipped_fast(fast_item, "comment chỉ có emoji", "đã LIKE")
+
+        # current_item phải còn nguyên (worker chưa xong c_running)
+        self.assertEqual(self.ws.current_item["comment_id"], "c_running")
+        # History có entry fast skip
+        self.assertEqual(len(self.ws.history), 1)
+        self.assertEqual(self.ws.history[0]["comment_id"], "c_fast")
+        self.assertIn("emoji", self.ws.history[0]["status"])
+        self.assertEqual(self.ws.history[0]["elapsed_sec"], 0)
+        # Counter skipped tăng
+        self.assertEqual(self.ws.total_skipped, 1)
+
+    def test_sheets_crash_does_not_break_reply_flow(self):
+        """Sheets ném exception ở dedup + log → reply vẫn thành công."""
+        import main as m
+        from config import settings as s
+
+        sheets_mock = MagicMock()
+        # is_already_replied ném → bị swallow → trả False (coi như chưa reply)
+        sheets_mock.is_already_replied.side_effect = RuntimeError("Sheets API down")
+        # log_comment ném → bị swallow
+        sheets_mock.log_comment.side_effect = RuntimeError("Sheets write fail")
+
+        reply_mock = AsyncMock(return_value=True)
+        orig_auto = s.AUTO_LIKE_ENABLED
+        s.AUTO_LIKE_ENABLED = False  # giảm bớt mock
+
+        try:
+            with patch("main._fb_delay", AsyncMock(return_value=None)), \
+                 patch("main.like_comment", AsyncMock(return_value=True)), \
+                 patch("main.reply_comment", reply_mock), \
+                 patch("main.get_post_content", AsyncMock(return_value="post")), \
+                 patch("main.generate_reply", AsyncMock(return_value="câu reply")), \
+                 patch("main.queue_db.is_replied", return_value=False), \
+                 patch("main.queue_db.mark_replied"), \
+                 patch("main.sheets", sheets_mock):
+                asyncio.run(m.process_comment(
+                    page_id=MOCK_PAGE_ID, post_id="999", comment_id="c1",
+                    comment_text="câu hỏi dài đủ ý", commenter_id="u1",
+                    commenter_name="U",
+                ))
+        finally:
+            s.AUTO_LIKE_ENABLED = orig_auto
+
+        # Reply vẫn được gọi → bot vẫn hoạt động khi Sheets sập
+        reply_mock.assert_called_once()
+        # Sheets được thử gọi nhưng bị exception (được swallow)
+        sheets_mock.is_already_replied.assert_called_once()
+
+    def test_sheets_timeout_falls_back_to_false(self):
+        """Sheets treo → asyncio.TimeoutError → _sheets_is_replied trả False."""
+        import main as m
+
+        async def raise_timeout(coro, *args, **kwargs):
+            coro.close()  # dọn inner coroutine để tránh RuntimeWarning
+            raise asyncio.TimeoutError()
+
+        sheets_mock = MagicMock()
+        with patch("main.sheets", sheets_mock), \
+             patch("main.asyncio.wait_for", side_effect=raise_timeout):
+            result = asyncio.run(m._sheets_is_replied("c1"))
+
+        # TimeoutError bị catch, trả False → worker tiếp tục không treo
+        self.assertFalse(result)
+
+    def test_sheets_log_timeout_does_not_raise(self):
+        """_sheets_log timeout → nuốt exception, worker không crash."""
+        import main as m
+
+        async def raise_timeout(coro, *args, **kwargs):
+            coro.close()  # dọn inner coroutine để tránh RuntimeWarning
+            raise asyncio.TimeoutError()
+
+        sheets_mock = MagicMock()
+        with patch("main.sheets", sheets_mock), \
+             patch("main.asyncio.wait_for", side_effect=raise_timeout):
+            # Không ném exception dù wait_for timeout
+            asyncio.run(m._sheets_log(
+                post_id="p", comment_id="c", commenter_name="N",
+                comment_text="t", reply_text="r", status="s", like_status="",
+            ))
+
+    def test_post_content_cache_ttl(self):
+        """_get_post_cached chỉ fetch 1 lần trong TTL window."""
+        import main as m
+
+        fetch_calls = []
+
+        async def fake_fetch(post_id, token):
+            fetch_calls.append(post_id)
+            return f"content of {post_id}"
+
+        # Clear cache trước test
+        m._post_cache.clear()
+        with patch("main.get_post_content", side_effect=fake_fetch):
+            async def run():
+                a = await m._get_post_cached("P1")
+                b = await m._get_post_cached("P1")  # cache hit
+                c = await m._get_post_cached("P2")  # miss
+                d = await m._get_post_cached("P1")  # cache hit
+                return a, b, c, d
+
+            a, b, c, d = asyncio.run(run())
+
+        # Chỉ 2 fetch thực tế (P1 1 lần, P2 1 lần)
+        self.assertEqual(fetch_calls, ["P1", "P2"])
+        self.assertEqual(a, "content of P1")
+        self.assertEqual(b, "content of P1")
+        self.assertEqual(c, "content of P2")
+
+    def test_post_content_cache_expires(self):
+        """Cache entry quá TTL → refetch."""
+        import main as m
+
+        fetch_calls = []
+
+        async def fake_fetch(post_id, token):
+            fetch_calls.append(post_id)
+            return "v1" if len(fetch_calls) == 1 else "v2"
+
+        m._post_cache.clear()
+        orig_ttl = m._POST_CACHE_TTL
+        m._POST_CACHE_TTL = 0.05  # 50ms
+        try:
+            with patch("main.get_post_content", side_effect=fake_fetch):
+                async def run():
+                    a = await m._get_post_cached("P1")
+                    await asyncio.sleep(0.08)  # hết TTL
+                    b = await m._get_post_cached("P1")
+                    return a, b
+                a, b = asyncio.run(run())
+        finally:
+            m._POST_CACHE_TTL = orig_ttl
+
+        self.assertEqual(len(fetch_calls), 2)
+        self.assertEqual(a, "v1")
+        self.assertEqual(b, "v2")
+
     def test_counters_include_in_flight_and_total_done(self):
         """Counters có thêm in_flight và total_done."""
         self.ws.on_start_processing(self._sample_item("c1"))
@@ -991,6 +1215,115 @@ class TestWorkerState(unittest.TestCase):
         snap = self.ws.snapshot(queue_size=0)
         self.assertEqual(snap["counters"]["in_flight"], 1)
         self.assertEqual(snap["counters"]["total_done"], 2)  # completed + skipped
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TEST: queue_db dedup local (mark_replied / is_replied)
+# ═══════════════════════════════════════════════════════════════════════════
+class TestQueueDbDedup(unittest.TestCase):
+    """Verify SQLite local dedup – thay cho Sheets full-scan chậm."""
+
+    def setUp(self):
+        import tempfile
+        import queue_db as qdb
+        # Dùng DB riêng cho từng test, không đụng file prod
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self._tmp.close()
+        self._orig_path = qdb.DB_PATH
+        qdb.DB_PATH = self._tmp.name
+        qdb.init_db()
+        self.qdb = qdb
+
+    def tearDown(self):
+        self.qdb.DB_PATH = self._orig_path
+        try:
+            os.unlink(self._tmp.name)
+        except Exception:
+            pass
+
+    def _item(self, cid="c1"):
+        return {
+            "comment_id": cid, "page_id": "P", "post_id": "POST1",
+            "comment_text": "hi", "commenter_id": "U", "commenter_name": "N",
+        }
+
+    def test_mark_replied_and_is_replied(self):
+        self.qdb.save_pending(self._item("c1"))
+        self.assertFalse(self.qdb.is_replied("c1"))
+
+        self.qdb.mark_replied("c1")
+        self.assertTrue(self.qdb.is_replied("c1"))
+
+    def test_is_replied_nonexistent(self):
+        self.assertFalse(self.qdb.is_replied("not_saved"))
+
+    def test_save_filtered_dedup(self):
+        """save_filtered: INSERT OR IGNORE – duplicate webhook → False."""
+        first = self.qdb.save_filtered(self._item("c2"))
+        second = self.qdb.save_filtered(self._item("c2"))
+        self.assertTrue(first)
+        self.assertFalse(second)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TEST: model_stats debounced save
+# ═══════════════════════════════════════════════════════════════════════════
+class TestModelStatsDebounce(unittest.TestCase):
+    """Debounce giảm IO: N updates nhanh → 1 write."""
+
+    def setUp(self):
+        import tempfile
+        import model_stats as ms
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        self._tmp.close()
+        self._orig = ms.STATS_FILE
+        ms.STATS_FILE = self._tmp.name
+        self.ms = ms
+        self.s = ms.ModelStats()
+
+    def tearDown(self):
+        self.ms.STATS_FILE = self._orig
+        try:
+            os.unlink(self._tmp.name)
+        except Exception:
+            pass
+
+    def test_rapid_updates_trigger_at_most_one_write(self):
+        """10 updates trong <debounce → chỉ 1 write thực tế (hoặc 0 nếu lần đầu trong window)."""
+        write_count = [0]
+        orig_write = self.s._write_file
+
+        def counted_write():
+            write_count[0] += 1
+            orig_write()
+
+        self.s._write_file = counted_write
+        # Đánh dấu đã vừa save (để các _save tiếp theo bị debounce)
+        self.s._last_save_time = time.time()
+
+        for _ in range(10):
+            self.s.record_free_success()
+
+        # Tất cả 10 bị debounce, không write lần nào. Dirty flag = True.
+        self.assertEqual(write_count[0], 0)
+        self.assertTrue(self.s._dirty)
+
+    def test_flush_writes_if_dirty(self):
+        """flush() ghi nếu có dirty update chờ."""
+        write_count = [0]
+        orig_write = self.s._write_file
+
+        def counted_write():
+            write_count[0] += 1
+            orig_write()
+
+        self.s._write_file = counted_write
+        self.s._last_save_time = time.time()
+
+        self.s.record_free_success()  # dirty=True
+        self.s.flush()
+        self.assertEqual(write_count[0], 1)
+        self.assertFalse(self.s._dirty)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1010,6 +1343,8 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(TestWebhookEndpoints))
     suite.addTests(loader.loadTestsFromTestCase(TestCommentQueue))
     suite.addTests(loader.loadTestsFromTestCase(TestWorkerState))
+    suite.addTests(loader.loadTestsFromTestCase(TestQueueDbDedup))
+    suite.addTests(loader.loadTestsFromTestCase(TestModelStatsDebounce))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

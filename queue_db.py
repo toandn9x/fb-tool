@@ -66,6 +66,14 @@ def init_db():
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_status ON comment_queue(status)"
         )
+        # Migration: cột replied_at cho dedup local – thay cho full-scan Sheets.
+        # ALTER TABLE trong SQLite không hỗ trợ IF NOT EXISTS → try/except.
+        try:
+            conn.execute(
+                "ALTER TABLE comment_queue ADD COLUMN replied_at TEXT DEFAULT NULL"
+            )
+        except sqlite3.OperationalError:
+            pass  # cột đã tồn tại
     logger.info(f"QueueDB initialized: {DB_PATH}")
 
 
@@ -101,6 +109,41 @@ def save_pending(item: dict) -> bool:
         return False
 
 
+def save_filtered(item: dict) -> bool:
+    """
+    Lưu comment bị fast-filter thẳng vào DB với status='done'
+    (không qua queue). INSERT OR IGNORE để dedup duplicate webhook.
+
+    Returns:
+        True nếu là comment mới, False nếu đã tồn tại (webhook trùng).
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    try:
+        with _conn_ctx() as conn:
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO comment_queue
+                    (comment_id, page_id, post_id, comment_text,
+                     commenter_id, commenter_name, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'done', ?, ?)
+                """,
+                (
+                    item["comment_id"],
+                    item["page_id"],
+                    item["post_id"],
+                    item["comment_text"],
+                    item["commenter_id"],
+                    item["commenter_name"],
+                    now,
+                    now,
+                ),
+            )
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.error(f"QueueDB save_filtered error: {e}")
+        return False
+
+
 def mark_processing(comment_id: str):
     """Đánh dấu comment đang được worker xử lý."""
     _update_status(comment_id, "processing")
@@ -109,6 +152,41 @@ def mark_processing(comment_id: str):
 def mark_done(comment_id: str):
     """Đánh dấu comment đã xử lý xong (reply / skip / error đều là 'done')."""
     _update_status(comment_id, "done")
+
+
+def mark_replied(comment_id: str):
+    """
+    Đánh dấu đã reply thành công lên FB. Gọi NGAY sau khi reply_comment() OK.
+    Cho phép dedup local (fast) thay vì phải query Google Sheets full-scan.
+    Bulletproof qua crash: nếu restart giữa reply và mark_done, ở lần load
+    lại, is_replied() trả True → skip reply lần 2.
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    try:
+        with _conn_ctx() as conn:
+            conn.execute(
+                "UPDATE comment_queue SET replied_at=?, updated_at=? WHERE comment_id=?",
+                (now, now, comment_id),
+            )
+    except Exception as e:
+        logger.error(f"QueueDB mark_replied error: {e}")
+
+
+def is_replied(comment_id: str) -> bool:
+    """
+    Check dedup local (< 1ms, không gọi network).
+    Trả True nếu comment đã được reply trước đó.
+    """
+    try:
+        with _conn_ctx() as conn:
+            row = conn.execute(
+                "SELECT replied_at FROM comment_queue WHERE comment_id=?",
+                (comment_id,),
+            ).fetchone()
+        return row is not None and row["replied_at"] is not None
+    except Exception as e:
+        logger.error(f"QueueDB is_replied error: {e}")
+        return False
 
 
 def _update_status(comment_id: str, status: str):

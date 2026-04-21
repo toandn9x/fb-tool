@@ -6,12 +6,18 @@ Lưu vào file JSON để persist qua restart.
 import json
 import logging
 import os
+import time
 from datetime import datetime, date
 from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
 STATS_FILE = os.path.join(os.path.dirname(__file__), "model_stats.json")
+
+# Debounce interval – chỉ write file mỗi N giây để giảm disk IO khi
+# có burst nhiều comment. Mất tối đa N giây dữ liệu nếu crash giữa chừng
+# (chấp nhận được vì stats chỉ mang tính tham khảo).
+_SAVE_DEBOUNCE_SEC = 3.0
 
 
 class ModelStats:
@@ -25,6 +31,9 @@ class ModelStats:
         # 10 comment gần nhất (tự reset theo ngày)
         self._recent_comments: list[dict] = []
         self._recent_comments_date: str = ""
+        # Debounce bookkeeping – tránh writes disk mỗi lần counter++
+        self._last_save_time: float = 0.0
+        self._dirty: bool = False
         # Load từ file nếu có
         self._load()
 
@@ -174,6 +183,23 @@ class ModelStats:
         }
 
     def _save(self):
+        """
+        Debounced save: chỉ write file nếu đã qua _SAVE_DEBOUNCE_SEC từ lần
+        save gần nhất. Nếu chưa đủ → chỉ set dirty flag, lần save sau sẽ bắt
+        kịp. Gọi flush() lúc shutdown để đảm bảo không mất update cuối.
+        """
+        now = time.time()
+        if (now - self._last_save_time) < _SAVE_DEBOUNCE_SEC:
+            self._dirty = True
+            return
+        self._write_file()
+
+    def flush(self):
+        """Force save (gọi khi shutdown hoặc background periodic task)."""
+        if self._dirty or (time.time() - self._last_save_time) >= _SAVE_DEBOUNCE_SEC:
+            self._write_file()
+
+    def _write_file(self):
         try:
             data = {
                 "daily": self.daily,
@@ -183,6 +209,8 @@ class ModelStats:
             }
             with open(STATS_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            self._last_save_time = time.time()
+            self._dirty = False
         except Exception as e:
             logger.error(f"Failed to save model stats: {e}")
 
