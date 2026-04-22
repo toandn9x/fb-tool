@@ -905,8 +905,9 @@ class TestCommentQueue(unittest.TestCase):
         mock_save_filtered.assert_called_once()
         # like_comment ĐƯỢC gọi (fast-path vẫn like)
         self.assertEqual(len(like_calls), 1)
-        # worker_state.record_skipped_fast được gọi
-        fake_ws.record_skipped_fast.assert_called_once()
+        # worker_state.record_skipped_fast KHÔNG được gọi – fast-filter là
+        # path riêng, không tính vào counter/history của worker monitor
+        fake_ws.record_skipped_fast.assert_not_called()
         # worker_state.on_enqueue KHÔNG được gọi (không vào queue)
         fake_ws.on_enqueue.assert_not_called()
 

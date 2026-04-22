@@ -215,14 +215,10 @@ async def webhook_handler(request: Request):
                     newly = queue_db.save_filtered(item)
                     if newly:
                         logger.info(
-                            f"Fast-filter skip {comment_id}: {fast_reason}"
+                            f"Fast-filter skip {comment_id}: {fast_reason} (logging to Sheets)"
                         )
                         asyncio.create_task(
                             _handle_filtered_comment(item, fast_reason)
-                        )
-                    else:
-                        logger.info(
-                            f"Duplicate filtered webhook, bỏ qua {comment_id}"
                         )
                     continue
 
@@ -268,12 +264,10 @@ async def _comment_worker():
             # Đánh dấu hoàn tất trong DB (dù lỗi hay thành công)
             queue_db.mark_done(comment_id)
             comment_queue.task_done()
-
-
 async def _handle_filtered_comment(item: dict, reason: str):
     """
-    Fast-path cho comment bị fast-filter: chỉ like + log Sheets, KHÔNG qua
-    queue/worker. Fire-and-forget – không block webhook response.
+    Fast-path cho comment bị lọc: vẫn Like + log Sheets để theo dõi,
+    nhưng KHÔNG đẩy vào queue xử lý AI và KHÔNG tính vào thống kê worker.
     """
     like_status = ""
     if settings.AUTO_LIKE_ENABLED:
@@ -285,9 +279,7 @@ async def _handle_filtered_comment(item: dict, reason: str):
                 reaction_type=reaction,
             )
             like_status = f"đã {reaction}" if liked else f"lỗi {reaction}"
-            logger.info(
-                f"Fast-react {item['comment_id']}: {like_status}"
-            )
+            logger.info(f"Fast-react {item['comment_id']}: {like_status}")
         except Exception as e:
             logger.error(f"Fast-react error: {e}")
             like_status = "lỗi react"
@@ -301,9 +293,8 @@ async def _handle_filtered_comment(item: dict, reason: str):
         status=f"bỏ qua – {reason}",
         like_status=like_status,
     )
+    # KHÔNG gọi worker_state.record_skipped_fast để tránh hiện lên màn worker
 
-    # Hiển thị trong history /worker mà không đụng tới current_item
-    worker_state.record_skipped_fast(item, reason, like_status)
 
 
 async def _fb_delay():
@@ -434,7 +425,7 @@ async def process_comment(
                 status=f"bỏ qua – {reason}",
                 like_status=like_status,
             )
-            worker_state.on_complete(f"bỏ qua – {reason}")
+            worker_state.on_complete("ignore")
             return
 
         # 3. Fetch post content for context (có cache TTL)
@@ -1011,9 +1002,6 @@ async def worker_page():
     reply_pct = (
         counters["completed"] / done * 100 if done > 0 else 0
     )
-    skip_pct = (
-        counters["skipped"] / done * 100 if done > 0 else 0
-    )
     fail_pct = (
         counters["failed"] / done * 100 if done > 0 else 0
     )
@@ -1466,13 +1454,11 @@ async def worker_page():
   </div>
   <div class="progress-bar-wrap">
     <div class="progress-seg green-bar" style="width:{(counters['completed']/total_for_pct*100) if total_for_pct else 0:.2f}%" title="Đã reply: {counters['completed']}"></div>
-    <div class="progress-seg yellow-bar" style="width:{(counters['skipped']/total_for_pct*100) if total_for_pct else 0:.2f}%" title="Bỏ qua: {counters['skipped']}"></div>
     <div class="progress-seg red-bar" style="width:{(counters['failed']/total_for_pct*100) if total_for_pct else 0:.2f}%" title="Lỗi: {counters['failed']}"></div>
     <div class="progress-seg inflight-bar" style="width:{(in_flight/total_for_pct*100) if total_for_pct else 0:.2f}%" title="Đang xử lý: {in_flight}"></div>
   </div>
   <div class="progress-legend">
     <span><span class="dot green-dot"></span>Reply {counters['completed']} ({reply_pct:.0f}%)</span>
-    <span><span class="dot yellow-dot"></span>Skip {counters['skipped']} ({skip_pct:.0f}%)</span>
     <span><span class="dot red-dot"></span>Lỗi {counters['failed']} ({fail_pct:.0f}%)</span>
     <span><span class="dot inflight-dot"></span>In-flight {in_flight}</span>
     <span><span class="dot queue-dot"></span>Chờ {in_queue}</span>
@@ -1502,7 +1488,6 @@ async def worker_page():
   <div class="counter-card"><div class="num" style="color:#a78bfa;">{counters['in_flight']}</div><div class="lbl">Đang xử lý</div></div>
   <div class="counter-card"><div class="num" style="color:#e0e0e0;">{counters['enqueued']}</div><div class="lbl">Tổng nhận</div></div>
   <div class="counter-card"><div class="num green">{counters['completed']}</div><div class="lbl">Đã reply</div></div>
-  <div class="counter-card"><div class="num yellow">{counters['skipped']}</div><div class="lbl">Bỏ qua</div></div>
   <div class="counter-card"><div class="num red">{counters['failed']}</div><div class="lbl">Lỗi</div></div>
 </div>
 

@@ -110,27 +110,28 @@ class WorkerState:
     ):
         self._check_day_rollover()
         if self.current_item and self.current_started_at:
-            elapsed = (datetime.now() - self.current_started_at).total_seconds()
-            self.history.append({
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "comment_id": self.current_item.get("comment_id", ""),
-                "commenter": self.current_item.get("commenter_name", ""),
-                "comment": self.current_item.get("comment_text", "")[:150],
-                "reply": reply_text[:200] if reply_text else "",
-                "model": model_used,
-                "post_id": self.current_item.get("post_id", ""),
-                "status": status,
-                "elapsed_sec": round(elapsed, 2),
-            })
-            if len(self.history) > MAX_HISTORY:
-                self.history = self.history[-MAX_HISTORY:]
+            if status != "ignore":
+                elapsed = (datetime.now() - self.current_started_at).total_seconds()
+                self.history.append({
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "comment_id": self.current_item.get("comment_id", ""),
+                    "commenter": self.current_item.get("commenter_name", ""),
+                    "comment": self.current_item.get("comment_text", "")[:150],
+                    "reply": reply_text[:200] if reply_text else "",
+                    "model": model_used,
+                    "post_id": self.current_item.get("post_id", ""),
+                    "status": status,
+                    "elapsed_sec": round(elapsed, 2),
+                })
+                if len(self.history) > MAX_HISTORY:
+                    self.history = self.history[-MAX_HISTORY:]
 
-            if status == "đã reply":
-                self.total_completed += 1
-            elif status.startswith("bỏ qua"):
-                self.total_skipped += 1
-            else:
-                self.total_failed += 1
+                if status == "đã reply":
+                    self.total_completed += 1
+                elif status.startswith("bỏ qua"):
+                    self.total_skipped += 1
+                else:
+                    self.total_failed += 1
 
         self.current_item = None
         self.current_started_at = None
