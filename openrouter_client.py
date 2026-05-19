@@ -331,14 +331,24 @@ async def _call_openrouter(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
                 OPENROUTER_API_URL, json=payload, headers=headers
             )
             response.raise_for_status()
             data = response.json()
 
-            raw_reply = data["choices"][0]["message"]["content"].strip()
+            choices = data.get("choices", [])
+            if not choices:
+                logger.warning(f"[{model}] API returned no choices. Data: {data}")
+                return get_random_fallback()
+                
+            content = choices[0].get("message", {}).get("content")
+            if content is None:
+                logger.warning(f"[{model}] AI returned empty/None content.")
+                return get_random_fallback()
+
+            raw_reply = content.strip()
             reply = _clean_ai_reply(raw_reply)
 
             # Nếu sau khi clean mà rỗng → dùng fallback
