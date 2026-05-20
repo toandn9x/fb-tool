@@ -338,17 +338,7 @@ async def _call_openrouter(
             response.raise_for_status()
             data = response.json()
 
-            choices = data.get("choices", [])
-            if not choices:
-                logger.warning(f"[{model}] API returned no choices. Data: {data}")
-                return get_random_fallback()
-                
-            content = choices[0].get("message", {}).get("content")
-            if content is None:
-                logger.warning(f"[{model}] AI returned empty/None content.")
-                return get_random_fallback()
-
-            raw_reply = content.strip()
+            raw_reply = data["choices"][0]["message"]["content"].strip()
             reply = _clean_ai_reply(raw_reply)
 
             # Nếu sau khi clean mà rỗng → dùng fallback
