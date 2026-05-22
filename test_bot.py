@@ -557,6 +557,94 @@ class TestWebhookEndpoints(unittest.TestCase):
         data = response.json()
         self.assertEqual(data["status"], "ignored")
 
+    @patch("main.comment_queue")
+    @patch("main.fast_filter")
+    @patch("main.queue_db.save_pending")
+    @patch("main.queue_db.save_filtered")
+    def test_webhook_only_top_level_comments(self, mock_save_filtered, mock_save_pending, mock_fast_filter, mock_comment_queue):
+        from config import settings
+        mock_fast_filter.return_value = (True, "OK")
+        mock_save_pending.return_value = True
+        mock_save_filtered.return_value = True
+        mock_comment_queue.put = AsyncMock()
+        
+        # Test Case 1: ONLY_TOP_LEVEL_COMMENTS is True, and payload is a reply comment (parent_id != post_id)
+        settings.ONLY_TOP_LEVEL_COMMENTS = True
+        payload_reply = {
+            "object": "page",
+            "entry": [
+                {
+                    "id": MOCK_PAGE_ID,
+                    "changes": [
+                        {
+                            "field": "feed",
+                            "value": {
+                                "item": "comment",
+                                "verb": "add",
+                                "comment_id": "999_888_777",
+                                "post_id": "999",
+                                "parent_id": "999_888",  # Different from post_id "999"
+                                "message": "Reply comment text",
+                                "from": {"id": "555666777", "name": "Nguyễn Văn Test"}
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+        
+        # Reset mock
+        mock_fast_filter.reset_mock()
+        response = self.client.post("/webhook", json=payload_reply)
+        self.assertEqual(response.status_code, 200)
+        # fast_filter should NOT be called because the loop should continue/skip before reaching it
+        mock_fast_filter.assert_not_called()
+
+        # Test Case 2: ONLY_TOP_LEVEL_COMMENTS is True, and payload is a top-level comment (parent_id == post_id)
+        payload_top = {
+            "object": "page",
+            "entry": [
+                {
+                    "id": MOCK_PAGE_ID,
+                    "changes": [
+                        {
+                            "field": "feed",
+                            "value": {
+                                "item": "comment",
+                                "verb": "add",
+                                "comment_id": "999_888",
+                                "post_id": "999",
+                                "parent_id": "999",  # Equal to post_id
+                                "message": "Top-level comment text",
+                                "from": {"id": "555666777", "name": "Nguyễn Văn Test"}
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+        
+        # Reset mock
+        mock_fast_filter.reset_mock()
+        response = self.client.post("/webhook", json=payload_top)
+        self.assertEqual(response.status_code, 200)
+        # fast_filter SHOULD be called since this is a top-level comment
+        mock_fast_filter.assert_called_once()
+
+        # Test Case 3: ONLY_TOP_LEVEL_COMMENTS is False, and payload is a reply comment (parent_id != post_id)
+        # It should process both top-level and replies
+        settings.ONLY_TOP_LEVEL_COMMENTS = False
+        
+        # Reset mock
+        mock_fast_filter.reset_mock()
+        response = self.client.post("/webhook", json=payload_reply)
+        self.assertEqual(response.status_code, 200)
+        # fast_filter SHOULD be called because the setting is disabled
+        mock_fast_filter.assert_called_once()
+        
+        # Restore default settings
+        settings.ONLY_TOP_LEVEL_COMMENTS = True
+
     def test_worker_page_returns_html(self):
         """Trang /worker trả HTML với các counter và stage label."""
         response = self.client.get("/worker")

@@ -74,6 +74,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Cooldown: {settings.MODEL_FALLBACK_COOLDOWN} phút")
     logger.info(f"  Delay   : {settings.REPLY_DELAY_SECONDS}s (áp dụng cho cả react & reply, tuần tự)")
     logger.info(f"  AutoLike: {settings.AUTO_LIKE_ENABLED} ({settings.AUTO_LIKE_REACTION_TYPE})")
+    logger.info(f"  TopLevel: {settings.ONLY_TOP_LEVEL_COMMENTS} (chỉ trả lời comment gốc)")
     logger.info(f"  Sheet   : {settings.GOOGLE_SHEET_NAME}")
     logger.info("-" * 50)
     port = settings.SERVER_PORT
@@ -187,6 +188,19 @@ async def webhook_handler(request: Request):
             commenter = value.get("from", {})
             commenter_id = commenter.get("id", "")
             commenter_name = commenter.get("name", "Unknown")
+
+            # Bỏ qua reply-to-comment (chỉ trả lời top-level comment dưới
+            # post) khi flag bật. Chặn vòng lặp bot reply chính reply của
+            # mình do FB webhook deliver lại. parent_id == post_id nghĩa
+            # là comment gốc; khác nghĩa là reply vào comment khác.
+            if settings.ONLY_TOP_LEVEL_COMMENTS:
+                parent_id = value.get("parent_id", "")
+                if parent_id and parent_id != post_id:
+                    logger.info(
+                        f"Skip reply-to-comment {comment_id} "
+                        f"(parent={parent_id}, post={post_id})"
+                    )
+                    continue
 
             logger.info(
                 f"New comment from {commenter_name}: "

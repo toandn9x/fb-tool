@@ -43,6 +43,12 @@ class Settings:
         self.REPLY_DELAY_SECONDS = int(os.getenv("REPLY_DELAY_SECONDS", "5"))
         self.SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
 
+        # Chỉ trả lời top-level comment (bỏ qua reply-to-comment).
+        # Bật để chặn vòng lặp bot reply chính reply của mình qua webhook.
+        self.ONLY_TOP_LEVEL_COMMENTS = os.getenv(
+            "ONLY_TOP_LEVEL_COMMENTS", "true"
+        ).lower() in ("true", "1", "yes")
+
         # Auto Like/React
         self.AUTO_LIKE_ENABLED = os.getenv(
             "AUTO_LIKE_ENABLED", "true"
